@@ -45,6 +45,25 @@ properties:
     description: The number of PWM channels configured for this instance
     enum: [6, 9]
 
+  allwinner,pwm-pair-clock-sources:
+    description: The clock source names for each PWM pair
+    items:
+      enum: [hosc, apb]
+    minItems: 1
+    maxItems: 8
+
+  allwinner,pwm-pair-clock-prescales:
+    description: The prescale (DIV_M register) values for each PWM pair
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        minimum: 0
+        maximum: 8
+      minItems: 1
+      maxItems: 1
+    minItems: 1
+    maxItems: 8
+
 allOf:
   - $ref: pwm.yaml#
 
