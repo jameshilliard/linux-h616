@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * PWM Controller Driver for sunxi platforms (D1, T113-S3 and R329)
+ * PWM Controller Driver for sunxi platforms (D1, T113-S3, R329 and H616)
  *
  * Limitations:
  * - When the parameters change, current running period will not be completed
@@ -20,8 +20,17 @@
 #include <linux/pwm.h>
 #include <linux/reset.h>
 
+#define SUN20I_PWM_REG_OFFSET_PER_D1		(0x0080)
+#define SUN20I_PWM_REG_OFFSET_PCR_D1		(0x0100 + 0x0000)
+#define SUN20I_PWM_REG_OFFSET_PPR_D1		(0x0100 + 0x0004)
+#define SUN20I_PWM_REG_OFFSET_PER_H616		(0x0040)
+#define SUN20I_PWM_REG_OFFSET_PCR_H616		(0x0060 + 0x0000)
+#define SUN20I_PWM_REG_OFFSET_PPR_H616		(0x0060 + 0x0004)
+
 #define SUN20I_PWM_CLK_CFG(chan)		(0x20 + (((chan) >> 1) * 0x4))
 #define SUN20I_PWM_CLK_CFG_SRC			GENMASK(8, 7)
+#define SUN20I_PWM_CLK_CFG_BYPASS(chan)		BIT(5 + ((chan) & 1))
+#define SUN20I_PWM_CLK_CFG_GATING		BIT(4)
 #define SUN20I_PWM_CLK_CFG_DIV_M		GENMASK(3, 0)
 #define SUN20I_PWM_CLK_DIV_M_MAX		8
 
@@ -29,15 +38,15 @@
 #define SUN20I_PWM_CLK_GATE_BYPASS(chan)	BIT((chan) + 16)
 #define SUN20I_PWM_CLK_GATE_GATING(chan)	BIT(chan)
 
-#define SUN20I_PWM_ENABLE			0x80
+#define SUN20I_PWM_ENABLE(chip)			((chip)->data->reg_per)
 #define SUN20I_PWM_ENABLE_EN(chan)		BIT(chan)
 
-#define SUN20I_PWM_CTL(chan)			(0x100 + (chan) * 0x20)
+#define SUN20I_PWM_CTL(chip, chan)		((chip)->data->reg_pcr + (chan) * 0x20)
 #define SUN20I_PWM_CTL_ACT_STA			BIT(8)
 #define SUN20I_PWM_CTL_PRESCAL_K		GENMASK(7, 0)
 #define SUN20I_PWM_CTL_PRESCAL_K_MAX		field_max(SUN20I_PWM_CTL_PRESCAL_K)
 
-#define SUN20I_PWM_PERIOD(chan)			(0x104 + (chan) * 0x20)
+#define SUN20I_PWM_PERIOD(chip, chan)		((chip)->data->reg_ppr + (chan) * 0x20)
 #define SUN20I_PWM_PERIOD_ENTIRE_CYCLE		GENMASK(31, 16)
 #define SUN20I_PWM_PERIOD_ACT_CYCLE		GENMASK(15, 0)
 
@@ -91,6 +100,13 @@
  */
 #define SUN20I_PWM_MAGIC			(255 * 65537 + 2 * 65536 + 1)
 
+struct sun20i_pwm_data {
+	unsigned long reg_per;
+	unsigned long reg_pcr;
+	unsigned long reg_ppr;
+	bool has_pcgr;
+};
+
 struct sun20i_pwm_chip {
 	struct clk *clk_bus, *clk_hosc, *clk_apb;
 	struct reset_control *rst;
@@ -98,6 +114,7 @@ struct sun20i_pwm_chip {
 	void __iomem *base;
 	/* Mutex to protect pwm apply state */
 	struct mutex mutex;
+	const struct sun20i_pwm_data *data;
 };
 
 static inline struct sun20i_pwm_chip *to_sun20i_pwm_chip(struct pwm_chip *chip)
@@ -139,16 +156,16 @@ static int sun20i_pwm_get_state(struct pwm_chip *chip,
 	else
 		clk_rate = clk_get_rate(sun20i_chip->clk_apb);
 
-	val = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CTL(pwm->hwpwm));
+	val = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CTL(sun20i_chip, pwm->hwpwm));
 	state->polarity = (SUN20I_PWM_CTL_ACT_STA & val) ?
 			   PWM_POLARITY_NORMAL : PWM_POLARITY_INVERSED;
 
 	prescale_k = FIELD_GET(SUN20I_PWM_CTL_PRESCAL_K, val) + 1;
 
-	val = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_ENABLE);
+	val = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_ENABLE(sun20i_chip));
 	state->enabled = (SUN20I_PWM_ENABLE_EN(pwm->hwpwm) & val) ? true : false;
 
-	val = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_PERIOD(pwm->hwpwm));
+	val = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_PERIOD(sun20i_chip, pwm->hwpwm));
 
 	mutex_unlock(&sun20i_chip->mutex);
 
@@ -187,23 +204,32 @@ static int sun20i_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 
 	mutex_lock(&sun20i_chip->mutex);
 
-	pwm_en = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_ENABLE);
+	pwm_en = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_ENABLE(sun20i_chip));
 
-	if (state->enabled != pwm->state.enabled) {
-		clk_gate = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CLK_GATE);
-
-		if (!state->enabled) {
+	if (state->enabled != pwm->state.enabled && !state->enabled) {
+		if (sun20i_chip->data->has_pcgr) {
+			/* Disabling the gate via PWM Clock Gating Register */
+			clk_gate = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CLK_GATE);
 			clk_gate &= ~SUN20I_PWM_CLK_GATE_GATING(pwm->hwpwm);
-			pwm_en &= ~SUN20I_PWM_ENABLE_EN(pwm->hwpwm);
-			sun20i_pwm_writel(sun20i_chip, pwm_en, SUN20I_PWM_ENABLE);
 			sun20i_pwm_writel(sun20i_chip, clk_gate, SUN20I_PWM_CLK_GATE);
+		} else if (!(pwm_en & SUN20I_PWM_ENABLE_EN(pwm->hwpwm ^ 1))) {
+			/*
+			 * Disabling the gate via PWM Clock Configuration Register
+			 * if and only if the counterpart channel is disabled
+			 */
+			clk_cfg = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CLK_CFG(pwm->hwpwm));
+			clk_cfg &= ~SUN20I_PWM_CLK_CFG_GATING;
+			sun20i_pwm_writel(sun20i_chip, clk_cfg, SUN20I_PWM_CLK_CFG(pwm->hwpwm));
 		}
+
+		pwm_en &= ~SUN20I_PWM_ENABLE_EN(pwm->hwpwm);
+		sun20i_pwm_writel(sun20i_chip, pwm_en, sun20i_chip->data->reg_per);
 	}
 
 	if (state->polarity != pwm->state.polarity ||
 	    state->duty_cycle != pwm->state.duty_cycle ||
 	    state->period != pwm->state.period) {
-		ctl = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CTL(pwm->hwpwm));
+		ctl = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CTL(sun20i_chip, pwm->hwpwm));
 		clk_cfg = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CLK_CFG(pwm->hwpwm));
 		hosc_rate = clk_get_rate(sun20i_chip->clk_hosc);
 		bus_rate = clk_get_rate(sun20i_chip->clk_apb);
@@ -234,7 +260,8 @@ static int sun20i_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 			}
 
 			/* set up the CLK_DIV_M and clock CLK_SRC */
-			clk_cfg = FIELD_PREP(SUN20I_PWM_CLK_CFG_DIV_M, div_m);
+			clk_cfg &= ~(SUN20I_PWM_CLK_CFG_DIV_M | SUN20I_PWM_CLK_CFG_SRC);
+			clk_cfg |= FIELD_PREP(SUN20I_PWM_CLK_CFG_DIV_M, div_m);
 			clk_cfg |= FIELD_PREP(SUN20I_PWM_CLK_CFG_SRC, use_bus_clk);
 
 			sun20i_pwm_writel(sun20i_chip, clk_cfg, SUN20I_PWM_CLK_CFG(pwm->hwpwm));
@@ -265,21 +292,33 @@ static int sun20i_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
 		 * Duty-cycle = T high-level / T period
 		 */
 		reg_period |= FIELD_PREP(SUN20I_PWM_PERIOD_ACT_CYCLE, act_cycle);
-		sun20i_pwm_writel(sun20i_chip, reg_period, SUN20I_PWM_PERIOD(pwm->hwpwm));
+		sun20i_pwm_writel(sun20i_chip, reg_period,
+			SUN20I_PWM_PERIOD(sun20i_chip, pwm->hwpwm));
 
 		ctl = FIELD_PREP(SUN20I_PWM_CTL_PRESCAL_K, prescale_k);
 		if (state->polarity == PWM_POLARITY_NORMAL)
 			ctl |= SUN20I_PWM_CTL_ACT_STA;
 
-		sun20i_pwm_writel(sun20i_chip, ctl, SUN20I_PWM_CTL(pwm->hwpwm));
+		sun20i_pwm_writel(sun20i_chip, ctl, SUN20I_PWM_CTL(sun20i_chip, pwm->hwpwm));
 	}
 
 	if (state->enabled != pwm->state.enabled && state->enabled) {
-		clk_gate &= ~SUN20I_PWM_CLK_GATE_BYPASS(pwm->hwpwm);
-		clk_gate |= SUN20I_PWM_CLK_GATE_GATING(pwm->hwpwm);
+		if (sun20i_chip->data->has_pcgr) {
+			/* Enabling the gate via PWM Clock Gating Register */
+			clk_gate = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CLK_GATE);
+			clk_gate &= ~SUN20I_PWM_CLK_GATE_BYPASS(pwm->hwpwm);
+			clk_gate |= SUN20I_PWM_CLK_GATE_GATING(pwm->hwpwm);
+			sun20i_pwm_writel(sun20i_chip, clk_gate, SUN20I_PWM_CLK_GATE);
+		} else {
+			/* Enabling the gate via PWM Clock Configuration Register */
+			clk_cfg = sun20i_pwm_readl(sun20i_chip, SUN20I_PWM_CLK_CFG(pwm->hwpwm));
+			clk_cfg &= ~SUN20I_PWM_CLK_CFG_BYPASS(pwm->hwpwm);
+			clk_cfg |= SUN20I_PWM_CLK_CFG_GATING;
+			sun20i_pwm_writel(sun20i_chip, clk_cfg, SUN20I_PWM_CLK_CFG(pwm->hwpwm));
+		}
+
 		pwm_en |= SUN20I_PWM_ENABLE_EN(pwm->hwpwm);
-		sun20i_pwm_writel(sun20i_chip, pwm_en, SUN20I_PWM_ENABLE);
-		sun20i_pwm_writel(sun20i_chip, clk_gate, SUN20I_PWM_CLK_GATE);
+		sun20i_pwm_writel(sun20i_chip, pwm_en, SUN20I_PWM_ENABLE(sun20i_chip));
 	}
 
 unlock_mutex:
@@ -293,8 +332,29 @@ static const struct pwm_ops sun20i_pwm_ops = {
 	.get_state = sun20i_pwm_get_state,
 };
 
+static const struct sun20i_pwm_data sun20i_d1_pwm_data = {
+	.reg_per = SUN20I_PWM_REG_OFFSET_PER_D1,
+	.reg_pcr = SUN20I_PWM_REG_OFFSET_PCR_D1,
+	.reg_ppr = SUN20I_PWM_REG_OFFSET_PPR_D1,
+	.has_pcgr = true,
+};
+
+static const struct sun20i_pwm_data sun50i_h616_pwm_data = {
+	.reg_per = SUN20I_PWM_REG_OFFSET_PER_H616,
+	.reg_pcr = SUN20I_PWM_REG_OFFSET_PCR_H616,
+	.reg_ppr = SUN20I_PWM_REG_OFFSET_PPR_H616,
+	.has_pcgr = false,
+};
+
 static const struct of_device_id sun20i_pwm_dt_ids[] = {
-	{ .compatible = "allwinner,sun20i-d1-pwm" },
+	{
+		.compatible = "allwinner,sun20i-d1-pwm",
+		.data = &sun20i_d1_pwm_data
+	},
+	{
+		.compatible = "allwinner,sun50i-h616-pwm",
+		.data = &sun50i_h616_pwm_data
+	},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, sun20i_pwm_dt_ids);
@@ -337,6 +397,8 @@ static int sun20i_pwm_probe(struct platform_device *pdev)
 	sun20i_chip->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sun20i_chip->base))
 		return PTR_ERR(sun20i_chip->base);
+
+	sun20i_chip->data = data;
 
 	sun20i_chip->clk_bus = devm_clk_get_enabled(&pdev->dev, "bus");
 	if (IS_ERR(sun20i_chip->clk_bus))
@@ -388,5 +450,6 @@ static struct platform_driver sun20i_pwm_driver = {
 module_platform_driver(sun20i_pwm_driver);
 
 MODULE_AUTHOR("Aleksandr Shubin <privatesub2@gmail.com>");
+MODULE_AUTHOR("Hironori KIKUCHI <kikuchan98@gmail.com>");
 MODULE_DESCRIPTION("Allwinner sun20i PWM driver");
 MODULE_LICENSE("GPL");
