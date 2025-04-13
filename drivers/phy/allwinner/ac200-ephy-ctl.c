@@ -261,13 +261,11 @@ err_disable_ephy:
 	return ret;
 }
 
-static int ac200_ephy_ctl_remove(struct platform_device *pdev)
+static void ac200_ephy_ctl_remove(struct platform_device *pdev)
 {
 	struct ac200_ephy_ctl_dev *priv = platform_get_drvdata(pdev);
 
 	ac200_ephy_ctl_disable(priv);
-
-	return 0;
 }
 
 static const struct of_device_id ac200_ephy_ctl_match[] = {
