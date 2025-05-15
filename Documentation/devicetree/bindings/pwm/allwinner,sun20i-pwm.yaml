@@ -14,6 +14,7 @@ properties:
   compatible:
     oneOf:
       - const: allwinner,sun20i-d1-pwm
+      - const: allwinner,sun50i-h616-pwm
       - items:
           - const: allwinner,sun50i-r329-pwm
           - const: allwinner,sun20i-d1-pwm
