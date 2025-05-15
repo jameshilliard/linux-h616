@@ -221,6 +221,19 @@
 			clocks = <&osc24M>;
 		};
 
+		pwm: pwm@300a000 {
+			compatible = "allwinner,sun50i-h616-pwm";
+			reg = <0x0300a000 0x400>;
+			allwinner,npwms = <6>;
+			clocks = <&ccu CLK_BUS_PWM>,
+				 <&osc24M>,
+				 <&ccu CLK_APB1>;
+			clock-names = "bus", "hosc", "apb";
+			resets = <&ccu RST_BUS_PWM>;
+			#pwm-cells = <0x3>;
+			status = "disabled";
+		};
+
 		pio: pinctrl@300b000 {
 			compatible = "allwinner,sun50i-h616-pinctrl";
 			reg = <0x0300b000 0x400>;
