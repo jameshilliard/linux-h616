@@ -11,6 +11,7 @@
 #include <linux/mdio-mux.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
@@ -279,6 +280,8 @@ static const struct emac_variant emac_variant_h6 = {
 #define SYSCON_ETCS_MII		0x0
 #define SYSCON_ETCS_EXT_GMII	0x1
 #define SYSCON_ETCS_INT_GMII	0x2
+
+#define AC300_KEY		BIT(8)
 
 /* sun8i_dwmac_dma_reset() - reset the EMAC
  * Called from stmmac via stmmac_dma_ops->reset
@@ -1162,6 +1165,7 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
 	struct net_device *ndev;
 	struct regmap *regmap;
 	u32 syscon_idx = 0;
+	u16 val;
 
 	ret = stmmac_get_platform_resources(pdev, &stmmac_res);
 	if (ret)
@@ -1232,6 +1236,20 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
 	plat_dat = devm_stmmac_probe_config_dt(pdev, stmmac_res.mac);
 	if (IS_ERR(plat_dat))
 		return PTR_ERR(plat_dat);
+
+	if (!nvmem_cell_read_u16(dev, "ac300", &val)) {
+		struct device_node *mdio_node;
+		const char *flag = (val & AC300_KEY) ?
+			"x-powers,ac300-ephy" : "x-powers,ac200-ephy";
+
+		mdio_node = of_get_child_by_name(dev->of_node, "mdio");
+		for_each_available_child_of_node_scoped(mdio_node, child) {
+			if (of_property_read_bool(child, flag)) {
+				plat_dat->phy_node = of_node_get(child);
+				break;
+			}
+		}
+	}
 
 	/* platform data specifying hardware features and callbacks.
 	 * hardware features were copied from Allwinner drivers.
