@@ -213,6 +213,30 @@
 	status = "okay";
 };
 
+&nfc {
+	status = "okay";
+
+	// DMA is not working for now
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+	pinctrl-names = "default";
+	pinctrl-0 = <&nand_pins> , <&nand_cs0_pin>, <&nand_rb0_pin>;
+	nand@0 {
+		/* TC58NVG1SHTA00 */
+		reg = <0>;
+		allwinner,rb = <0>;
+		/* let's try with none first */
+		nand-ecc-mode = "hw";
+		/*
+		 * This nand requires only 8 bits per 512b
+		 * but if we can correct more, let's do it
+		 */
+		nand-ecc-strength = <8>;
+		nand-ecc-step-size = <512>;
+		nand-ecc-maximize;
+	};
+};
+
 /*
 &usbotg {
 	dr_mode = "host";
