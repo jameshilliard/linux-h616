@@ -39,6 +39,7 @@ properties:
               - allwinner,sun50i-a100-emac
               - allwinner,sun50i-h6-emac
               - allwinner,sun50i-h616-emac0
+              - allwinner,sun50i-h616-emac1
               - allwinner,sun55i-a523-gmac0
           - const: allwinner,sun50i-a64-emac
       - items:
@@ -215,6 +216,23 @@ allOf:
             - compatible
             - mdio-parent-bus
             - mdio@1
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - allwinner,sun50i-h616-emac1
+
+    then:
+      properties:
+        allwinner,ac300-config:
+          $ref: /schemas/types.yaml#/definitions/phandle
+          description:
+            Phandle to the X-Powers AC300 PHY configuration module.
+            The AC300 contains a EPHY that must be configured prior
+            being usable by the MAC.
+            The AC300 handles this configuration via MDIO.
 
   - if:
       properties:
