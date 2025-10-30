@@ -1231,6 +1231,22 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
 	 */
 	pm_runtime_get_sync(&pdev->dev);
 
+	{
+		struct device_node *ac300_node;
+		struct phy_device *config_phy;
+
+		ac300_node = of_parse_phandle(dev->of_node, "allwinner,ac300-config", 0);
+		if (ac300_node) {
+			config_phy = of_phy_find_device(ac300_node);
+			printk("ac300_node FOUND\n");
+			of_node_put(ac300_node);
+			if (config_phy) {
+			printk("ac300_PHY FOUND\n");
+				phy_init_hw(config_phy);
+			}
+		}
+	}
+
 	/* The mux must be registered after parent MDIO
 	 * so after stmmac_dvr_probe()
 	 */
