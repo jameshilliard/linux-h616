@@ -21,7 +21,7 @@
 	};
 
 	chosen {
-		bootargs = "console=ttyS1,115200 loglevel=8";
+		bootargs = "console=ttyS1,115200 loglevel=8 earlycon clk_ignore_unused";
 		stdout-path = "serial1:115200n8";
 	};
 
@@ -37,7 +37,7 @@
 
 &{/soc} {
 	emac1: ethernet@5030000 {
-		compatible = "allwinner,sun50i-h616-emac";
+		compatible = "allwinner,sun50i-h616-emac1";
 		reg = <0x05030000 0x10000>;
 		interrupts = <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "macirq";
@@ -62,8 +62,9 @@
 &emac1 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&rmii_pins>;
-	phy-handle = <&rmii_phy>;
+	phy-handle = <&ac300_ephy>;
 	phy-supply = <&reg_dldo1>;
+	allwinner,ac300-config = <&ac300_config>;
 	allwinner,rx-delay-ps = <3100>;
 	allwinner,tx-delay-ps = <700>;
 	status = "okay";
@@ -82,10 +83,15 @@
 };
 
 &mdio1 {
-	rmii_phy: ethernet-phy@0 {
+	ac300_config: ethernet-phy@10 {
 		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <0x10>;
+		clocks = <&pwm 5>;
+	};
+
+	ac300_ephy: ethernet-phy@0 {
+		compatible = "ethernet-phy-id0044.1400";
 		reg = <0>;
-		clocks = <&ccu CLK_EMAC_25M>;
 	};
 };
 
@@ -97,12 +103,6 @@
 	vcc-pg-supply = <&reg_aldo1>;
 	vcc-ph-supply = <&reg_dldo1>;
 	vcc-pi-supply = <&reg_dldo1>;
-
-	pwm5_pin: pwm5-pin {
-		pins = "PA12";
-		function = "pwm5";
-		bias-pull-up;
-	};
 
 	rmii_pins: rmii-pins {
 		pins = "PA0", "PA1", "PA2", "PA3", "PA4",
@@ -132,6 +132,8 @@
 };
 
 &pwm {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm1_pin>;
 	status = "okay";
 };
 
