@@ -73,6 +73,12 @@ struct musb_hw_ep;
 #define musb_dma_inventra(musb)		0
 #endif
 
+#ifdef CONFIG_USB_SUNXI_MUSB_DMA
+#define musb_dma_sunxi(musb)		((musb)->ops->quirks & MUSB_DMA_SUNXI)
+#else
+#define musb_dma_sunxi(musb)		0
+#endif
+
 #if defined(CONFIG_USB_TI_CPPI41_DMA)
 #define	is_cppi_enabled(musb)		musb_dma_cppi41(musb)
 #else

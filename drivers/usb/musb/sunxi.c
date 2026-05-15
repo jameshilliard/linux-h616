@@ -9,6 +9,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/extcon.h>
 #include <linux/io.h>
@@ -18,6 +19,7 @@
 #include <linux/phy/phy-sun4i-usb.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
+#include <linux/slab.h>
 #include <linux/soc/sunxi/sunxi_sram.h>
 #include <linux/usb/musb.h>
 #include <linux/usb/of.h>
@@ -55,6 +57,25 @@
 
 /* VEND0 bits */
 #define SUNXI_MUSB_VEND0_PIO_MODE		0
+#define SUNXI_MUSB_VEND0_DMA_MODE		BIT(0)
+
+/* DMA register offsets */
+#define SUNXI_MUSB_DMA_INTE			0x0000
+#define SUNXI_MUSB_DMA_INTS			0x0004
+#define SUNXI_MUSB_DMA_CHAN_CFG(n)		(0x0040 + (0x10 * (n)))
+#define SUNXI_MUSB_DMA_CHAN_ADDR(n)		(0x0044 + (0x10 * (n)))
+#define SUNXI_MUSB_DMA_CHAN_COUNT(n)		(0x0048 + (0x10 * (n)))
+#define SUNXI_MUSB_DMA_CHAN_RESIDUAL(n)		(0x004c + (0x10 * (n)))
+
+#define SUNXI_MUSB_DMA_CHANNELS			8
+#define SUNXI_MUSB_DMA_ADDR_ALIGN		4
+#define SUNXI_MUSB_DMA_MAX_LEN			0x100000
+#define SUNXI_MUSB_DMA_CFG_ENABLE		BIT(31)
+#define SUNXI_MUSB_DMA_CFG_DIR_RX		BIT(4)
+#define SUNXI_MUSB_DMA_CFG_EP_MASK		GENMASK(3, 0)
+#define SUNXI_MUSB_DMA_CFG_PKTSIZE_MASK		GENMASK(26, 16)
+#define SUNXI_MUSB_DMA_CFG_PKTSIZE_SHIFT	16
+#define SUNXI_MUSB_DMA_INT_MASK			GENMASK(SUNXI_MUSB_DMA_CHANNELS - 1, 0)
 
 /* flags */
 #define SUNXI_MUSB_FL_ENABLED			0
@@ -66,12 +87,14 @@
 #define SUNXI_MUSB_FL_HAS_RESET			6
 #define SUNXI_MUSB_FL_NO_CONFIGDATA		7
 #define SUNXI_MUSB_FL_PHY_MODE_PEND		8
+#define SUNXI_MUSB_FL_HAS_DMA			9
 
 struct sunxi_musb_cfg {
 	const struct musb_hdrc_config *hdrc_config;
 	bool has_sram;
 	bool has_reset;
 	bool no_configdata;
+	bool has_dma;
 };
 
 /* Our read/write methods need access and do not get passed in a musb ref :| */
@@ -92,6 +115,8 @@ struct sunxi_glue {
 	struct extcon_dev	*extcon;
 	struct notifier_block	host_nb;
 };
+
+static bool sunxi_musb_dma_interrupt(struct musb *musb);
 
 /* phy_power_on / off may sleep, so we use a workqueue  */
 static void sunxi_musb_work(struct work_struct *work)
@@ -175,6 +200,8 @@ static irqreturn_t sunxi_musb_interrupt(int irq, void *__hci)
 {
 	struct musb *musb = __hci;
 	unsigned long flags;
+	irqreturn_t ret;
+	bool dma_handled;
 
 	spin_lock_irqsave(&musb->lock, flags);
 
@@ -196,11 +223,12 @@ static irqreturn_t sunxi_musb_interrupt(int irq, void *__hci)
 	if (musb->int_rx)
 		writew(musb->int_rx, musb->mregs + SUNXI_MUSB_INTRRX);
 
-	musb_interrupt(musb);
+	ret = musb_interrupt(musb);
+	dma_handled = sunxi_musb_dma_interrupt(musb);
 
 	spin_unlock_irqrestore(&musb->lock, flags);
 
-	return IRQ_HANDLED;
+	return ret == IRQ_HANDLED || dma_handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static int sunxi_musb_host_notifier(struct notifier_block *nb,
@@ -244,7 +272,12 @@ static int sunxi_musb_init(struct musb *musb)
 			goto error_clk_disable;
 	}
 
-	writeb(SUNXI_MUSB_VEND0_PIO_MODE, musb->mregs + SUNXI_MUSB_VEND0);
+	if (test_bit(SUNXI_MUSB_FL_HAS_DMA, &glue->flags))
+		writeb(SUNXI_MUSB_VEND0_DMA_MODE,
+		       musb->mregs + SUNXI_MUSB_VEND0);
+	else
+		writeb(SUNXI_MUSB_VEND0_PIO_MODE,
+		       musb->mregs + SUNXI_MUSB_VEND0);
 
 	/* Register notifier before calling phy_init() */
 	ret = devm_extcon_register_notifier(glue->dev, glue->extcon,
@@ -316,6 +349,293 @@ static void sunxi_musb_disable(struct musb *musb)
 	clear_bit(SUNXI_MUSB_FL_ENABLED, &glue->flags);
 }
 
+struct sunxi_musb_dma_controller;
+
+struct sunxi_musb_dma_channel {
+	struct dma_channel channel;
+	struct sunxi_musb_dma_controller *controller;
+	u32 len;
+	u8 idx;
+	u8 epnum;
+	u8 transmit;
+};
+
+struct sunxi_musb_dma_controller {
+	struct dma_controller controller;
+	struct sunxi_musb_dma_channel channel[SUNXI_MUSB_DMA_CHANNELS];
+	void __iomem *base;
+	u8 used;
+};
+
+#ifdef CONFIG_USB_SUNXI_MUSB_DMA
+static void sunxi_musb_dma_stop_channel(struct sunxi_musb_dma_channel *chan)
+{
+	struct sunxi_musb_dma_controller *controller = chan->controller;
+	void __iomem *base = controller->base;
+	u32 val;
+
+	val = readl(base + SUNXI_MUSB_DMA_CHAN_CFG(chan->idx));
+	val &= ~SUNXI_MUSB_DMA_CFG_ENABLE;
+	writel(val, base + SUNXI_MUSB_DMA_CHAN_CFG(chan->idx));
+
+	val = readl(base + SUNXI_MUSB_DMA_INTE);
+	val &= ~BIT(chan->idx);
+	writel(val, base + SUNXI_MUSB_DMA_INTE);
+
+	writel(BIT(chan->idx), base + SUNXI_MUSB_DMA_INTS);
+}
+
+static size_t sunxi_musb_dma_actual_len(struct sunxi_musb_dma_channel *chan)
+{
+	struct sunxi_musb_dma_controller *controller = chan->controller;
+	u32 residual;
+
+	residual = readl(controller->base +
+			 SUNXI_MUSB_DMA_CHAN_RESIDUAL(chan->idx));
+	residual = min(residual, chan->len);
+
+	return chan->len - residual;
+}
+
+static struct dma_channel *
+sunxi_musb_dma_channel_alloc(struct dma_controller *c,
+			     struct musb_hw_ep *hw_ep, u8 transmit)
+{
+	struct sunxi_musb_dma_controller *controller;
+	struct sunxi_musb_dma_channel *chan;
+	unsigned int i;
+
+	if (!hw_ep->epnum)
+		return NULL;
+
+	controller = container_of(c, struct sunxi_musb_dma_controller,
+				  controller);
+
+	for (i = 0; i < SUNXI_MUSB_DMA_CHANNELS; i++) {
+		if (controller->used & BIT(i))
+			continue;
+
+		controller->used |= BIT(i);
+		chan = &controller->channel[i];
+		chan->controller = controller;
+		chan->idx = i;
+		chan->epnum = hw_ep->epnum;
+		chan->transmit = transmit;
+		chan->len = 0;
+		chan->channel.max_len = SUNXI_MUSB_DMA_MAX_LEN;
+		chan->channel.actual_len = 0;
+		chan->channel.status = MUSB_DMA_STATUS_FREE;
+		chan->channel.desired_mode = transmit;
+
+		return &chan->channel;
+	}
+
+	return NULL;
+}
+
+static void sunxi_musb_dma_channel_release(struct dma_channel *channel)
+{
+	struct sunxi_musb_dma_channel *chan = channel->private_data;
+
+	if (channel->status == MUSB_DMA_STATUS_BUSY)
+		sunxi_musb_dma_stop_channel(chan);
+
+	channel->actual_len = 0;
+	channel->status = MUSB_DMA_STATUS_UNKNOWN;
+	chan->len = 0;
+	chan->controller->used &= ~BIT(chan->idx);
+}
+
+static int sunxi_musb_dma_channel_program(struct dma_channel *channel,
+					  u16 maxpacket, u8 mode,
+					  dma_addr_t dma_addr, u32 len)
+{
+	struct sunxi_musb_dma_channel *chan = channel->private_data;
+	struct sunxi_musb_dma_controller *controller = chan->controller;
+	u32 cfg;
+
+	if (channel->status == MUSB_DMA_STATUS_UNKNOWN ||
+	    channel->status == MUSB_DMA_STATUS_BUSY)
+		return false;
+
+	if (!len || !IS_ALIGNED(dma_addr, SUNXI_MUSB_DMA_ADDR_ALIGN))
+		return false;
+
+	len = min_t(u32, len, SUNXI_MUSB_DMA_MAX_LEN);
+	channel->actual_len = 0;
+	channel->desired_mode = mode;
+	channel->status = MUSB_DMA_STATUS_BUSY;
+	chan->len = len;
+
+	cfg = chan->epnum & SUNXI_MUSB_DMA_CFG_EP_MASK;
+	cfg |= (maxpacket << SUNXI_MUSB_DMA_CFG_PKTSIZE_SHIFT) &
+	       SUNXI_MUSB_DMA_CFG_PKTSIZE_MASK;
+	if (!chan->transmit)
+		cfg |= SUNXI_MUSB_DMA_CFG_DIR_RX;
+
+	writel(0, controller->base + SUNXI_MUSB_DMA_CHAN_CFG(chan->idx));
+	writel(lower_32_bits(dma_addr),
+	       controller->base + SUNXI_MUSB_DMA_CHAN_ADDR(chan->idx));
+	writel(len, controller->base + SUNXI_MUSB_DMA_CHAN_COUNT(chan->idx));
+	writel(BIT(chan->idx), controller->base + SUNXI_MUSB_DMA_INTS);
+
+	cfg |= SUNXI_MUSB_DMA_CFG_ENABLE;
+	writel(readl(controller->base + SUNXI_MUSB_DMA_INTE) | BIT(chan->idx),
+	       controller->base + SUNXI_MUSB_DMA_INTE);
+	writel(cfg, controller->base + SUNXI_MUSB_DMA_CHAN_CFG(chan->idx));
+
+	return true;
+}
+
+static int sunxi_musb_dma_channel_abort(struct dma_channel *channel)
+{
+	struct sunxi_musb_dma_channel *chan = channel->private_data;
+	struct sunxi_musb_dma_controller *controller = chan->controller;
+	struct musb *musb = controller->controller.musb;
+	void __iomem *epio = musb->endpoints[chan->epnum].regs;
+	u16 csr;
+
+	if (channel->status != MUSB_DMA_STATUS_BUSY &&
+	    channel->status != MUSB_DMA_STATUS_BUS_ABORT &&
+	    channel->status != MUSB_DMA_STATUS_CORE_ABORT)
+		return 0;
+
+	if (chan->transmit) {
+		csr = musb_readw(epio, MUSB_TXCSR);
+		csr &= ~(MUSB_TXCSR_AUTOSET | MUSB_TXCSR_DMAENAB |
+			 MUSB_TXCSR_DMAMODE);
+		musb_writew(epio, MUSB_TXCSR,
+			    csr | (is_host_active(musb) ?
+				   MUSB_TXCSR_H_WZC_BITS :
+				   MUSB_TXCSR_P_WZC_BITS));
+	} else {
+		csr = musb_readw(epio, MUSB_RXCSR);
+		csr &= ~(MUSB_RXCSR_AUTOCLEAR | MUSB_RXCSR_DMAENAB |
+			 MUSB_RXCSR_DMAMODE);
+		musb_writew(epio, MUSB_RXCSR,
+			    csr | (is_host_active(musb) ?
+				   MUSB_RXCSR_H_WZC_BITS :
+				   MUSB_RXCSR_P_WZC_BITS));
+	}
+
+	channel->actual_len = sunxi_musb_dma_actual_len(chan);
+	sunxi_musb_dma_stop_channel(chan);
+	channel->status = MUSB_DMA_STATUS_FREE;
+
+	return 0;
+}
+
+static int sunxi_musb_dma_is_compatible(struct dma_channel *channel,
+					u16 maxpacket, void *buf, u32 len)
+{
+	return len && IS_ALIGNED((unsigned long)buf, SUNXI_MUSB_DMA_ADDR_ALIGN);
+}
+
+static struct dma_controller *
+sunxi_musb_dma_controller_create(struct musb *musb, void __iomem *base)
+{
+	struct platform_device *pdev = to_platform_device(musb->controller);
+	struct sunxi_glue *glue = dev_get_drvdata(musb->controller->parent);
+	struct sunxi_musb_dma_controller *controller;
+	struct resource *res;
+	unsigned int i;
+
+	if (!test_bit(SUNXI_MUSB_FL_HAS_DMA, &glue->flags))
+		return NULL;
+
+	controller = kzalloc_obj(*controller, GFP_KERNEL);
+	if (!controller)
+		return ERR_PTR(-ENOMEM);
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dma");
+	if (!res) {
+		kfree(controller);
+		return NULL;
+	}
+
+	controller->base = devm_ioremap_resource(musb->controller, res);
+	if (IS_ERR(controller->base)) {
+		struct dma_controller *ret = ERR_CAST(controller->base);
+
+		kfree(controller);
+		return ret;
+	}
+
+	controller->controller.musb = musb;
+	controller->controller.channel_alloc = sunxi_musb_dma_channel_alloc;
+	controller->controller.channel_release = sunxi_musb_dma_channel_release;
+	controller->controller.channel_program = sunxi_musb_dma_channel_program;
+	controller->controller.channel_abort = sunxi_musb_dma_channel_abort;
+	controller->controller.is_compatible = sunxi_musb_dma_is_compatible;
+
+	for (i = 0; i < SUNXI_MUSB_DMA_CHANNELS; i++)
+		controller->channel[i].channel.private_data =
+			&controller->channel[i];
+
+	writel(0, controller->base + SUNXI_MUSB_DMA_INTE);
+	writel(SUNXI_MUSB_DMA_INT_MASK,
+	       controller->base + SUNXI_MUSB_DMA_INTS);
+
+	return &controller->controller;
+}
+
+static void sunxi_musb_dma_controller_destroy(struct dma_controller *c)
+{
+	struct sunxi_musb_dma_controller *controller;
+	unsigned int i;
+
+	if (!c)
+		return;
+
+	controller = container_of(c, struct sunxi_musb_dma_controller,
+				  controller);
+
+	writel(0, controller->base + SUNXI_MUSB_DMA_INTE);
+	for (i = 0; i < SUNXI_MUSB_DMA_CHANNELS; i++)
+		writel(0, controller->base + SUNXI_MUSB_DMA_CHAN_CFG(i));
+	writel(SUNXI_MUSB_DMA_INT_MASK,
+	       controller->base + SUNXI_MUSB_DMA_INTS);
+
+	kfree(controller);
+}
+
+static bool sunxi_musb_dma_interrupt(struct musb *musb)
+{
+	struct sunxi_musb_dma_controller *controller;
+	u32 pending;
+	unsigned int i;
+
+	if (!musb->dma_controller || !musb_dma_sunxi(musb))
+		return false;
+
+	controller = container_of(musb->dma_controller,
+				  struct sunxi_musb_dma_controller, controller);
+	pending = readl(controller->base + SUNXI_MUSB_DMA_INTS) &
+		  SUNXI_MUSB_DMA_INT_MASK;
+	if (!pending)
+		return false;
+
+	for (i = 0; i < SUNXI_MUSB_DMA_CHANNELS; i++) {
+		struct sunxi_musb_dma_channel *chan = &controller->channel[i];
+		struct dma_channel *channel = &chan->channel;
+
+		if (!(pending & BIT(i)))
+			continue;
+
+		if (channel->status != MUSB_DMA_STATUS_BUSY) {
+			writel(BIT(i), controller->base + SUNXI_MUSB_DMA_INTS);
+			continue;
+		}
+
+		channel->actual_len = sunxi_musb_dma_actual_len(chan);
+		sunxi_musb_dma_stop_channel(chan);
+		channel->status = MUSB_DMA_STATUS_FREE;
+		musb_dma_completion(musb, chan->epnum, chan->transmit);
+	}
+
+	return true;
+}
+#else
 static struct dma_controller *
 sunxi_musb_dma_controller_create(struct musb *musb, void __iomem *base)
 {
@@ -325,6 +645,12 @@ sunxi_musb_dma_controller_create(struct musb *musb, void __iomem *base)
 static void sunxi_musb_dma_controller_destroy(struct dma_controller *c)
 {
 }
+
+static bool sunxi_musb_dma_interrupt(struct musb *musb)
+{
+	return false;
+}
+#endif
 
 static int sunxi_musb_set_mode(struct musb *musb, u8 mode)
 {
@@ -626,6 +952,28 @@ static const struct musb_platform_ops sunxi_musb_ops = {
 	.post_root_reset_end = sunxi_musb_post_root_reset_end,
 };
 
+static const struct musb_platform_ops sunxi_musb_dma_ops = {
+	.quirks		= MUSB_INDEXED_EP | MUSB_DMA_SUNXI,
+	.init		= sunxi_musb_init,
+	.exit		= sunxi_musb_exit,
+	.enable		= sunxi_musb_enable,
+	.disable	= sunxi_musb_disable,
+	.fifo_offset	= sunxi_musb_fifo_offset,
+	.ep_offset	= sunxi_musb_ep_offset,
+	.busctl_offset	= sunxi_musb_busctl_offset,
+	.readb		= sunxi_musb_readb,
+	.writeb		= sunxi_musb_writeb,
+	.readw		= sunxi_musb_readw,
+	.writew		= sunxi_musb_writew,
+	.dma_init	= sunxi_musb_dma_controller_create,
+	.dma_exit	= sunxi_musb_dma_controller_destroy,
+	.set_mode	= sunxi_musb_set_mode,
+	.recover	= sunxi_musb_recover,
+	.set_vbus	= sunxi_musb_set_vbus,
+	.pre_root_reset_end = sunxi_musb_pre_root_reset_end,
+	.post_root_reset_end = sunxi_musb_post_root_reset_end,
+};
+
 #define SUNXI_MUSB_RAM_BITS	11
 
 /* Allwinner OTG supports up to 5 endpoints */
@@ -737,6 +1085,11 @@ static int sunxi_musb_probe(struct platform_device *pdev)
 	if (cfg->no_configdata)
 		set_bit(SUNXI_MUSB_FL_NO_CONFIGDATA, &glue->flags);
 
+	if (cfg->has_dma && IS_ENABLED(CONFIG_USB_SUNXI_MUSB_DMA)) {
+		set_bit(SUNXI_MUSB_FL_HAS_DMA, &glue->flags);
+		pdata.platform_ops = &sunxi_musb_dma_ops;
+	}
+
 	glue->clk = devm_clk_get(&pdev->dev, NULL);
 	if (IS_ERR(glue->clk)) {
 		dev_err(&pdev->dev, "Error getting clock: %ld\n",
@@ -787,6 +1140,8 @@ static int sunxi_musb_probe(struct platform_device *pdev)
 	pinfo.num_res	= pdev->num_resources;
 	pinfo.data	= &pdata;
 	pinfo.size_data = sizeof(pdata);
+	if (test_bit(SUNXI_MUSB_FL_HAS_DMA, &glue->flags))
+		pinfo.dma_mask = DMA_BIT_MASK(32);
 
 	glue->musb_pdev = platform_device_register_full(&pinfo);
 	if (IS_ERR(glue->musb_pdev)) {
@@ -833,6 +1188,13 @@ static const struct sunxi_musb_cfg sun8i_h3_musb_cfg = {
 	.no_configdata = true,
 };
 
+static const struct sunxi_musb_cfg sun50i_h616_musb_cfg = {
+	.hdrc_config = &sunxi_musb_hdrc_config_4eps,
+	.has_reset = true,
+	.no_configdata = true,
+	.has_dma = true,
+};
+
 static const struct sunxi_musb_cfg suniv_f1c100s_musb_cfg = {
 	.hdrc_config = &sunxi_musb_hdrc_config_5eps,
 	.has_sram = true,
@@ -847,6 +1209,8 @@ static const struct of_device_id sunxi_musb_match[] = {
 	  .data = &sun6i_a31_musb_cfg, },
 	{ .compatible = "allwinner,sun8i-a33-musb",
 	  .data = &sun8i_a33_musb_cfg, },
+	{ .compatible = "allwinner,sun50i-h616-musb",
+	  .data = &sun50i_h616_musb_cfg, },
 	{ .compatible = "allwinner,sun8i-h3-musb",
 	  .data = &sun8i_h3_musb_cfg, },
 	{ .compatible = "allwinner,suniv-f1c100s-musb",

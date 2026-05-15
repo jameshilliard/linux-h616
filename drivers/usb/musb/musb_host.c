@@ -570,7 +570,7 @@ musb_rx_reinit(struct musb *musb, struct musb_qh *qh, u8 epnum)
 	ep->rx_reinit = 0;
 }
 
-static void musb_tx_dma_set_mode_mentor(struct musb_hw_ep *hw_ep, 
+static void musb_tx_dma_set_mode_mentor(struct musb_hw_ep *hw_ep,
 					struct musb_qh *qh,
 					u32 *length, u8 *mode)
 {
@@ -631,7 +631,8 @@ static bool musb_tx_dma_program(struct dma_controller *dma,
 	u16			pkt_size = qh->maxpacket;
 	u8			mode;
 
-	if (musb_dma_inventra(hw_ep->musb) || musb_dma_ux500(hw_ep->musb))
+	if (musb_dma_inventra(hw_ep->musb) || musb_dma_ux500(hw_ep->musb) ||
+	    musb_dma_sunxi(hw_ep->musb))
 		musb_tx_dma_set_mode_mentor(hw_ep, qh,
 					    &length, &mode);
 	else if (is_cppi_enabled(hw_ep->musb) || tusb_dma_omap(hw_ep->musb))
@@ -1497,7 +1498,7 @@ static inline int musb_rx_dma_iso_cppi41(struct dma_controller *dma,
 #endif
 
 #if defined(CONFIG_USB_INVENTRA_DMA) || defined(CONFIG_USB_UX500_DMA) || \
-	defined(CONFIG_USB_TI_CPPI41_DMA)
+	defined(CONFIG_USB_TI_CPPI41_DMA) || defined(CONFIG_USB_SUNXI_MUSB_DMA)
 /* Host side RX (IN) using Mentor DMA works as follows:
 	submit_urb ->
 		- if queue was empty, ProgramEndpoint
@@ -1851,6 +1852,7 @@ void musb_host_rx(struct musb *musb, u8 epnum)
 
 	/* FIXME this is _way_ too much in-line logic for Mentor DMA */
 	if (!musb_dma_inventra(musb) && !musb_dma_ux500(musb) &&
+	    !musb_dma_sunxi(musb) &&
 	    (rx_csr & MUSB_RXCSR_H_REQPKT)) {
 		/* REVISIT this happened for a while on some short reads...
 		 * the cleanup still needs investigation... looks bad...
@@ -1883,13 +1885,14 @@ void musb_host_rx(struct musb *musb, u8 epnum)
 		musb_writew(hw_ep->regs, MUSB_RXCSR, val);
 
 		if (musb_dma_inventra(musb) || musb_dma_ux500(musb) ||
-		    musb_dma_cppi41(musb)) {
-			    done = musb_rx_dma_inventra_cppi41(c, hw_ep, qh, urb, xfer_len);
-			    musb_dbg(hw_ep->musb,
-				    "ep %d dma %s, rxcsr %04x, rxcount %d",
-				    epnum, done ? "off" : "reset",
-				    musb_readw(epio, MUSB_RXCSR),
-				    musb_readw(epio, MUSB_RXCOUNT));
+		    musb_dma_cppi41(musb) || musb_dma_sunxi(musb)) {
+			done = musb_rx_dma_inventra_cppi41(c, hw_ep, qh, urb,
+							   xfer_len);
+			musb_dbg(hw_ep->musb,
+				 "ep %d dma %s, rxcsr %04x, rxcount %d",
+				 epnum, done ? "off" : "reset",
+				 musb_readw(epio, MUSB_RXCSR),
+				 musb_readw(epio, MUSB_RXCOUNT));
 		} else {
 			done = true;
 		}
@@ -1912,7 +1915,7 @@ void musb_host_rx(struct musb *musb, u8 epnum)
 
 		/* we are expecting IN packets */
 		if ((musb_dma_inventra(musb) || musb_dma_ux500(musb) ||
-		    musb_dma_cppi41(musb)) && dma) {
+		     musb_dma_cppi41(musb) || musb_dma_sunxi(musb)) && dma) {
 			musb_dbg(hw_ep->musb,
 				"RX%d count %d, buffer 0x%llx len %d/%d",
 				epnum, musb_readw(epio, MUSB_RXCOUNT),

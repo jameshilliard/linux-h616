@@ -281,7 +281,8 @@ static void txstate(struct musb *musb, struct musb_request *req)
 
 		/* MUSB_TXCSR_P_ISO is still set correctly */
 
-		if (musb_dma_inventra(musb) || musb_dma_ux500(musb)) {
+		if (musb_dma_inventra(musb) || musb_dma_ux500(musb) ||
+		    musb_dma_sunxi(musb)) {
 			if (request_size < musb_ep->packet_sz)
 				musb_ep->dma->desired_mode = 0;
 			else
@@ -453,10 +454,13 @@ void musb_g_tx(struct musb *musb, u8 epnum)
 	}
 
 	if (req) {
+		bool is_dma = false;
+		bool short_packet = false;
 
 		trace_musb_req_tx(req);
 
 		if (dma && (csr & MUSB_TXCSR_DMAENAB)) {
+			is_dma = true;
 			csr |= MUSB_TXCSR_P_WZC_BITS;
 			csr &= ~(MUSB_TXCSR_DMAENAB | MUSB_TXCSR_P_UNDERRUN |
 				 MUSB_TXCSR_TXPKTRDY | MUSB_TXCSR_AUTOSET);
@@ -472,10 +476,18 @@ void musb_g_tx(struct musb *musb, u8 epnum)
 		 * First, maybe a terminating short packet. Some DMA
 		 * engines might handle this by themselves.
 		 */
-		if ((request->zero && request->length)
-			&& (request->length % musb_ep->packet_sz == 0)
-			&& (request->actual == request->length)) {
+		if (request->zero && request->length &&
+		    request->length % musb_ep->packet_sz == 0 &&
+		    request->actual == request->length)
+			short_packet = true;
 
+		if ((musb_dma_inventra(musb) || musb_dma_ux500(musb) ||
+		     musb_dma_sunxi(musb)) && is_dma &&
+		    (!dma->desired_mode ||
+		     (request->actual & (musb_ep->packet_sz - 1))))
+			short_packet = true;
+
+		if (short_packet) {
 			/*
 			 * On DMA completion, FIFO may not be
 			 * available yet...
@@ -483,8 +495,8 @@ void musb_g_tx(struct musb *musb, u8 epnum)
 			if (csr & MUSB_TXCSR_TXPKTRDY)
 				return;
 
-			musb_writew(epio, MUSB_TXCSR, MUSB_TXCSR_MODE
-					| MUSB_TXCSR_TXPKTRDY);
+			musb_writew(epio, MUSB_TXCSR,
+				    MUSB_TXCSR_MODE | MUSB_TXCSR_TXPKTRDY);
 			request->zero = 0;
 		}
 
@@ -599,7 +611,8 @@ static void rxstate(struct musb *musb, struct musb_request *req)
 			if (!is_buffer_mapped(req))
 				goto buffer_aint_mapped;
 
-			if (musb_dma_inventra(musb)) {
+			if (musb_dma_inventra(musb) ||
+			    musb_dma_sunxi(musb)) {
 				struct dma_controller	*c;
 				struct dma_channel	*channel;
 				int			use_dma = 0;
@@ -857,7 +870,7 @@ void musb_g_rx(struct musb *musb, u8 epnum)
 		request->actual += musb_ep->dma->actual_len;
 
 #if defined(CONFIG_USB_INVENTRA_DMA) || defined(CONFIG_USB_TUSB_OMAP_DMA) || \
-	defined(CONFIG_USB_UX500_DMA)
+	defined(CONFIG_USB_UX500_DMA) || defined(CONFIG_USB_SUNXI_MUSB_DMA)
 		/* Autoclear doesn't clear RxPktRdy for short packets */
 		if ((dma->desired_mode == 0 && !hw_ep->rx_double_buffered)
 				|| (dma->actual_len
@@ -897,7 +910,7 @@ void musb_g_rx(struct musb *musb, u8 epnum)
 			return;
 	}
 #if defined(CONFIG_USB_INVENTRA_DMA) || defined(CONFIG_USB_TUSB_OMAP_DMA) || \
-	defined(CONFIG_USB_UX500_DMA)
+	defined(CONFIG_USB_UX500_DMA) || defined(CONFIG_USB_SUNXI_MUSB_DMA)
 exit:
 #endif
 	/* Analyze request */
