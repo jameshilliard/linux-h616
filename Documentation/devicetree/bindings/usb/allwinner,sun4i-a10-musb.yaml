@@ -32,7 +32,14 @@ properties:
           - const: allwinner,sun8i-h3-musb
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: mc
+      - const: dma
 
   interrupts:
     maxItems: 1
@@ -88,6 +95,27 @@ if:
 then:
   required:
     - resets
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: allwinner,sun50i-h616-musb
+
+    then:
+      properties:
+        reg:
+          minItems: 2
+        reg-names:
+          minItems: 2
+      required:
+        - reg-names
+
+    else:
+      properties:
+        reg:
+          maxItems: 1
 
 additionalProperties: false
 
