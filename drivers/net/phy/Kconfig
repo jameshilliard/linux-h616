@@ -487,6 +487,18 @@ config XPOWERS_AC300_PHY_CTL
 	  interface mode, clock and I/O controls through the separate MDIO
 	  control address.
 
+config XPOWERS_ACX00_PHY
+	tristate "X-Powers AC200/AC300 Ethernet PHY"
+	depends on OF_MDIO
+	help
+	  Enable the Fast Ethernet PHY driver shared by the X-Powers AC200
+	  and AC300 companion ICs. This driver configures the common link PHY
+	  and can select the matching control device at runtime on systems which
+	  contain either variant. Runtime variant detection requires NVMEM
+	  support. Dynamically enabling a control device which is not already
+	  available requires OF_DYNAMIC support. Fixed-function package LED
+	  outputs can be exposed through the PHY LED framework.
+
 config XILINX_GMII2RGMII
 	tristate "Xilinx GMII2RGMII converter driver"
 	help
