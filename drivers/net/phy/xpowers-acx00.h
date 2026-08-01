@@ -4,6 +4,8 @@
 
 #include <linux/phy.h>
 
+#define AC300_EPHY_CONTROL_ADDR_OFFSET	16
+
 enum acx00_ephy_led {
 	ACX00_EPHY_LED_LINK_ACTIVITY,
 	ACX00_EPHY_LED_SPEED,
