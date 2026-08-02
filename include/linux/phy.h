@@ -1391,6 +1391,24 @@ struct phy_driver {
 	 */
 	int (*disable_autonomous_eee)(struct phy_device *dev);
 
+	/**
+	 * @set_tx_lpi: Configure PHY-autonomous Tx LPI
+	 * @dev: PHY device to configure
+	 * @config: Requested Tx LPI enable state and idle timer
+	 *
+	 * The presence of this callback advertises that the driver supports
+	 * configuring PHY-autonomous LPI through the ethtool EEE Tx LPI fields.
+	 * It is not used for userspace configuration after phylib has handed LPI
+	 * control to the MAC. Drivers without this callback retain the legacy
+	 * behavior in which those fields only configure phylib and the attached
+	 * MAC. A request with Tx LPI disabled must be accepted regardless of the
+	 * timer, since the timer has no meaning while the transmitter is disabled.
+	 *
+	 * Return: 0 on success, negative errno on failure.
+	 */
+	int (*set_tx_lpi)(struct phy_device *dev,
+			  const struct eee_config *config);
+
 	/* Get and Set PHY tunables */
 	/** @get_tunable: Return the value of a tunable */
 	int (*get_tunable)(struct phy_device *dev,

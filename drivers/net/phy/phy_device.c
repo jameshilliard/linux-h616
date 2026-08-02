@@ -1357,6 +1357,21 @@ static int phy_poll_reset(struct phy_device *phydev)
 	return 0;
 }
 
+static int phy_disable_autonomous_tx_lpi(struct phy_device *phydev)
+{
+	struct eee_config config = phydev->eee_cfg;
+
+	if (phydev->drv->set_tx_lpi) {
+		config.tx_lpi_enabled = false;
+		return phydev->drv->set_tx_lpi(phydev, &config);
+	}
+
+	if (phydev->drv->disable_autonomous_eee)
+		return phydev->drv->disable_autonomous_eee(phydev);
+
+	return 0;
+}
+
 int phy_init_hw(struct phy_device *phydev)
 {
 	int ret = 0;
@@ -1395,9 +1410,8 @@ int phy_init_hw(struct phy_device *phydev)
 	}
 
 	/* Re-apply autonomous EEE disable after soft reset */
-	if (phydev->autonomous_eee_disabled &&
-	    phydev->drv->disable_autonomous_eee) {
-		ret = phydev->drv->disable_autonomous_eee(phydev);
+	if (phydev->autonomous_eee_disabled) {
+		ret = phy_disable_autonomous_tx_lpi(phydev);
 		if (ret)
 			return ret;
 	}
@@ -2973,8 +2987,9 @@ void phy_support_eee(struct phy_device *phydev)
 	 * manage LPI signaling instead. The flag is stored so it can be
 	 * re-applied after a PHY soft reset (e.g. suspend/resume).
 	 */
-	if (phydev->drv && phydev->drv->disable_autonomous_eee) {
-		int ret = phydev->drv->disable_autonomous_eee(phydev);
+	if (phydev->drv && (phydev->drv->set_tx_lpi ||
+			    phydev->drv->disable_autonomous_eee)) {
+		int ret = phy_disable_autonomous_tx_lpi(phydev);
 
 		if (ret)
 			phydev_warn(phydev, "Failed to disable autonomous EEE: %pe\n",
