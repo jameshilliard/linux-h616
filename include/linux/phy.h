@@ -22,6 +22,7 @@
 #include <linux/mii_timestamper.h>
 #include <linux/module.h>
 #include <linux/timer.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/device-id/mdio.h>
 #include <linux/u64_stats_sync.h>
@@ -391,7 +392,9 @@ struct mii_bus {
 	/** @state: State of bus structure */
 	enum {
 		MDIOBUS_ALLOCATED = 1,
+		MDIOBUS_REGISTERING,
 		MDIOBUS_REGISTERED,
+		MDIOBUS_UNREGISTERING,
 		MDIOBUS_UNREGISTERED,
 		MDIOBUS_RELEASED,
 	} state;
@@ -401,6 +404,18 @@ struct mii_bus {
 
 	/** @mdio_map: list of all MDIO devices on bus */
 	struct mdio_device *mdio_map[PHY_MAX_ADDR];
+	/** @mdio_map_pending: addresses with registration in progress */
+	u32 mdio_map_pending;
+	/** @mdio_map_lock: protects the MDIO device map and bus state */
+	struct mutex mdio_map_lock;
+	/** @mdio_map_wait: wait for active map operations during teardown */
+	wait_queue_head_t mdio_map_wait;
+	/** @mdio_map_ops: active registrations and firmware changes */
+	unsigned int mdio_map_ops;
+	/** @mdio_map_removals: firmware removals blocking PHY attachment */
+	unsigned int mdio_map_removals;
+	/** @mdio_map_retired: removed devices pinned until bus teardown */
+	struct list_head mdio_map_retired;
 
 	/** @phy_mask: PHY addresses to be ignored when probing */
 	u32 phy_mask;
@@ -652,6 +667,8 @@ struct phy_oatc14_sqi_capability {
  * @n_ports: Number of ports currently attached to the PHY
  * @max_n_ports: Max number of ports this PHY can expose
  * @lock:  Mutex for serialization access to PHY
+ * @attached: Whether a network device or standalone user attached the PHY;
+ *	protected by the MDIO bus map lock
  * @state_queue: Work queue for state machine
  * @link_down_events: Number of times link was lost
  * @shared: Pointer to private data shared by phys in one package
@@ -781,6 +798,7 @@ struct phy_device {
 	struct delayed_work state_queue;
 
 	struct mutex lock;
+	bool attached;
 
 	/* This may be modified under the rtnl lock */
 	bool sfp_bus_attached;
