@@ -252,6 +252,11 @@
 			cpu_speed_grade: cpu-speed-grade@0 {
 				reg = <0x0 2>;
 			};
+
+			ephy_configuration: ethernet-phy-configuration@2c {
+				reg = <0x2c 2>;
+				bits = <0 10>;
+			};
 		};
 
 		timer0: timer@3009000 {
@@ -322,6 +327,13 @@
 			i2c0_pins: i2c0-pins {
 				pins = "PI5", "PI6";
 				function = "i2c0";
+			};
+
+			/omit-if-no-ref/
+			i2c3_pa_pins: i2c3-pa-pins {
+				pins = "PA10", "PA11";
+				function = "i2c3";
+				bias-pull-up;
 			};
 
 			i2c3_ph_pins: i2c3-ph-pins {
