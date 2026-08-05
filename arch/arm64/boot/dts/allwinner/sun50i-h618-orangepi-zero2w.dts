@@ -6,6 +6,7 @@
 /dts-v1/;
 
 #include "sun50i-h616.dtsi"
+#include "sun50i-h616-acx00-ephy.dtsi"
 #include "sun50i-h616-cpu-opp.dtsi"
 
 #include <dt-bindings/gpio/gpio.h>
@@ -17,6 +18,7 @@
 	compatible = "xunlong,orangepi-zero2w", "allwinner,sun50i-h618";
 
 	aliases {
+		ethernet0 = &emac1;
 		serial0 = &uart0;
 	};
 
@@ -52,6 +54,10 @@
 		vin-supply = <&reg_vcc5v>;
 		regulator-always-on;
 	};
+};
+
+&acx00_ephy_package {
+	vcc-supply = <&reg_vcc3v3>;
 };
 
 &codec {

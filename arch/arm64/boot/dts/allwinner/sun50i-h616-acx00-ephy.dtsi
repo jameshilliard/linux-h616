@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Common X-Powers AC200/AC300 Ethernet PHY support for H616-family SoCs
+ *
+ * Copyright (C) 2026 James Hilliard <james.hilliard1@gmail.com>
+ */
+
+&emac1 {
+	phy-handle = <&acx00_ephy>;
+	status = "okay";
+};
+
+&i2c3 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c3_pa_pins>;
+	status = "fail-needs-probe";
+
+	ac200: mixed-signal@10 {
+		compatible = "x-powers,ac200";
+		reg = <0x10>;
+		clocks = <&pwm 5>;
+	};
+};
+
+&mdio1 {
+	acx00_ephy_package: ethernet-phy-package@0 {
+		compatible = "x-powers,acx00-ephy-package";
+		reg = <0>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&pwm 5>;
+		nvmem-cells = <&ephy_configuration>;
+		nvmem-cell-names = "configuration";
+		x-powers,ac200 = <&ac200>;
+
+		acx00_ephy: ethernet-phy@0 {
+			compatible = "ethernet-phy-id0044.1400";
+			reg = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&pwm5_pin>;
+		};
+	};
+};
+
+&pwm {
+	status = "okay";
+};
