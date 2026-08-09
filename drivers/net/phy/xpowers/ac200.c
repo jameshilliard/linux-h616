@@ -15,6 +15,7 @@
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #include "acx00.h"
 
@@ -50,6 +51,76 @@ struct ac200_ephy_ctl {
 	bool supply_enabled;
 	bool powered;
 };
+
+#if IS_ENABLED(CONFIG_OF_DYNAMIC)
+static bool ac200_ephy_node_needs_probe(struct device_node *node)
+{
+	const char *status;
+
+	return !of_property_read_string(node, "status", &status) &&
+	       !strcmp(status, "fail-needs-probe");
+}
+
+static int ac200_ephy_add_enable_path(struct device *dev,
+				      struct of_changeset *ocs,
+				      struct device_node *node,
+				      bool *changed)
+{
+	struct device_node *parent;
+	int ret;
+
+	parent = of_get_parent(node);
+	if (parent) {
+		ret = ac200_ephy_add_enable_path(dev, ocs, parent, changed);
+		of_node_put(parent);
+		if (ret)
+			return ret;
+	}
+
+	if (of_device_is_available(node))
+		return 0;
+
+	if (!ac200_ephy_node_needs_probe(node))
+		return dev_err_probe(dev, -ENODEV,
+				     "%pOF is unavailable without fail-needs-probe\n",
+				     node);
+
+	ret = of_changeset_update_prop_string(ocs, node, "status", "okay");
+	if (!ret)
+		*changed = true;
+
+	return ret;
+}
+
+static int ac200_ephy_enable_path(struct device *dev,
+				  struct device_node *node)
+{
+	struct of_changeset *ocs;
+	bool changed = false;
+	int ret;
+
+	ocs = kzalloc_obj(*ocs);
+	if (!ocs)
+		return -ENOMEM;
+
+	of_changeset_init(ocs);
+	ret = ac200_ephy_add_enable_path(dev, ocs, node, &changed);
+	if (ret || !changed)
+		goto out_destroy;
+
+	ret = of_changeset_apply(ocs);
+	if (ret)
+		goto out_destroy;
+
+	/* Keep the applied status properties alive for the lifetime of the DT. */
+	return 0;
+
+out_destroy:
+	of_changeset_destroy(ocs);
+	kfree(ocs);
+	return ret;
+}
+#endif
 
 static u16 ac200_ephy_ctl_config(const struct ac200_ephy_ctl *priv)
 {
@@ -231,6 +302,15 @@ ac200_ephy_ctl_create(struct phy_device *phydev,
 	if (!ac200_node)
 		return ERR_PTR(dev_err_probe(dev, -EINVAL,
 					     "missing x-powers,ac200 reference\n"));
+
+#if IS_ENABLED(CONFIG_OF_DYNAMIC)
+	ret = ac200_ephy_enable_path(dev, ac200_node);
+	if (ret) {
+		of_node_put(ac200_node);
+		return ERR_PTR(ret);
+	}
+#endif
+
 	client = of_find_i2c_device_by_node(ac200_node);
 	of_node_put(ac200_node);
 	if (!client) {
