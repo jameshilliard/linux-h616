@@ -10,6 +10,7 @@
 
 #include "io_uring.h"
 #include "alloc_cache.h"
+#include "cancel.h"
 #include "rsrc.h"
 #include "kbuf.h"
 #include "uring_cmd.h"
@@ -73,6 +74,29 @@ bool io_uring_try_cancel_uring_cmd(struct io_ring_ctx *ctx,
 		}
 	}
 	io_submit_flush_completions(ctx);
+	return ret;
+}
+
+int io_uring_cmd_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
+			unsigned int issue_flags)
+{
+	struct io_kiocb *req;
+	int ret = -ENOENT;
+
+	io_ring_submit_lock(ctx, issue_flags);
+	hlist_for_each_entry(req, &ctx->cancelable_uring_cmd, hash_node) {
+		struct io_uring_cmd *cmd;
+
+		if (!io_cancel_req_match(req, cd))
+			continue;
+
+		cmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
+		ret = req->file->f_op->uring_cmd(cmd, IO_URING_F_CANCEL |
+							 IO_URING_F_COMPLETE_DEFER);
+		break;
+	}
+	io_ring_submit_unlock(ctx, issue_flags);
+
 	return ret;
 }
 
