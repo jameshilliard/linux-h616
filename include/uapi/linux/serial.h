@@ -196,6 +196,12 @@ struct serial_iso7816 {
  */
 #define SERIAL_MSG_ABI_VERSION	1
 
+/* IORING_OP_URING_CMD operations for a serial file descriptor. */
+enum serial_uring_cmd {
+	SERIAL_URING_CMD_INVALID = 0,
+	SERIAL_URING_CMD_WRITE_MSG = 1,
+};
+
 /* serial_ioc_message_caps.flags */
 #define SERIAL_MSG_CAP_RS485	_BITUL(0)
 

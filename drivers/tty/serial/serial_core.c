@@ -12,10 +12,14 @@
 #include <linux/tty_flip.h>
 #include <linux/slab.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 #include <linux/init.h>
 #include <linux/console.h>
 #include <linux/gpio/consumer.h>
 #include <linux/hrtimer.h>
+#ifdef CONFIG_IO_URING
+#include <linux/io_uring/cmd.h>
+#endif
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
@@ -33,6 +37,7 @@
 
 #include <linux/irq.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #include "serial_base.h"
 
@@ -1082,12 +1087,20 @@ struct uart_framed_message {
 	struct uart_framed_transfer *transfers;
 	u8 *tx_buf;
 	size_t total_bytes;
+	atomic_t *cancelled;
 };
 
 static void uart_framed_message_free(struct uart_framed_message *message)
 {
 	kvfree(message->tx_buf);
 	kfree(message->transfers);
+}
+
+static bool
+uart_framed_message_interrupted(const struct uart_framed_message *message)
+{
+	return signal_pending(current) ||
+	       (message->cancelled && atomic_read(message->cancelled));
 }
 
 static int uart_framed_message_copy(struct serial_ioc_message __user *user,
@@ -1183,7 +1196,8 @@ out_free_user_transfers:
 	return ret;
 }
 
-static int uart_framed_sleep_until(ktime_t expires, bool interruptible)
+static int uart_framed_sleep_until(ktime_t expires, bool interruptible,
+				   const struct uart_framed_message *message)
 {
 	for (;;) {
 		ktime_t now = ktime_get();
@@ -1191,7 +1205,7 @@ static int uart_framed_sleep_until(ktime_t expires, bool interruptible)
 
 		if (remaining_ns <= 0)
 			return 0;
-		if (interruptible && signal_pending(current))
+		if (interruptible && uart_framed_message_interrupted(message))
 			return -ERESTARTSYS;
 
 		if (remaining_ns <= UART_MSG_BUSY_WAIT_NS) {
@@ -1201,7 +1215,7 @@ static int uart_framed_sleep_until(ktime_t expires, bool interruptible)
 
 		set_current_state(interruptible ? TASK_INTERRUPTIBLE :
 						  TASK_UNINTERRUPTIBLE);
-		if (interruptible && signal_pending(current)) {
+		if (interruptible && uart_framed_message_interrupted(message)) {
 			__set_current_state(TASK_RUNNING);
 			return -ERESTARTSYS;
 		}
@@ -1226,7 +1240,8 @@ static int uart_framed_software_empty(struct uart_port *uport)
 }
 
 static int uart_framed_wait_empty(struct uart_port *uport, ktime_t deadline,
-				  bool include_software, bool interruptible)
+				  bool include_software, bool interruptible,
+				  const struct uart_framed_message *message)
 {
 	ktime_t fast_poll_end = ktime_add_ns(ktime_get(),
 					    UART_MSG_FAST_POLL_NS);
@@ -1246,7 +1261,7 @@ static int uart_framed_wait_empty(struct uart_port *uport, ktime_t deadline,
 		if (software_empty &&
 		    (uport->ops->tx_empty(uport) & TIOCSER_TEMT))
 			return 0;
-		if (interruptible && signal_pending(current))
+		if (interruptible && uart_framed_message_interrupted(message))
 			return -ERESTARTSYS;
 
 		now = ktime_get();
@@ -1260,7 +1275,7 @@ static int uart_framed_wait_empty(struct uart_port *uport, ktime_t deadline,
 		poll_ns = clamp_t(u64, uport->frame_time,
 				  min_poll_ns, UART_MSG_MAX_POLL_NS);
 		next = ktime_add_ns(now, min_t(u64, poll_ns, remaining_ns));
-		if (uart_framed_sleep_until(next, interruptible))
+		if (uart_framed_sleep_until(next, interruptible, message))
 			return -ERESTARTSYS;
 	}
 }
@@ -1394,8 +1409,9 @@ static int uart_framed_begin(struct uart_port *uport)
 	return 0;
 }
 
-static int uart_framed_prepare_frame(struct uart_port *uport,
-				     ktime_t deadline)
+static int
+uart_framed_prepare_frame(struct uart_port *uport, ktime_t deadline,
+			  const struct uart_framed_message *message)
 {
 	if (!(uport->rs485.flags & SER_RS485_ENABLED))
 		return 0;
@@ -1409,7 +1425,7 @@ static int uart_framed_prepare_frame(struct uart_port *uport,
 		ret = uport->ops->prepare_frame(uport);
 		if (ret != -EAGAIN)
 			return ret;
-		if (signal_pending(current))
+		if (uart_framed_message_interrupted(message))
 			return -ERESTARTSYS;
 
 		now = ktime_get();
@@ -1420,7 +1436,7 @@ static int uart_framed_prepare_frame(struct uart_port *uport,
 		retry = ktime_add_ns(now, retry_ns);
 		if (ktime_after(retry, deadline))
 			retry = deadline;
-		ret = uart_framed_sleep_until(retry, true);
+		ret = uart_framed_sleep_until(retry, true, message);
 		if (ret)
 			return ret;
 	}
@@ -1480,7 +1496,8 @@ static int uart_framed_execute(struct uart_port *uport,
 		return ret;
 
 	for (;;) {
-		ret = uart_framed_wait_empty(uport, deadline, true, true);
+		ret = uart_framed_wait_empty(uport, deadline, true, true,
+					     message);
 		if (ret)
 			goto out_end;
 
@@ -1492,7 +1509,7 @@ static int uart_framed_execute(struct uart_port *uport,
 		goto out_end;
 
 	/* Close the race between observing TEMT and claiming the port. */
-	ret = uart_framed_wait_empty(uport, deadline, false, true);
+	ret = uart_framed_wait_empty(uport, deadline, false, true, message);
 	if (ret)
 		goto out_end;
 
@@ -1501,7 +1518,7 @@ static int uart_framed_execute(struct uart_port *uport,
 		ret = -ETIMEDOUT;
 		goto out_end;
 	}
-	ret = uart_framed_sleep_until(initial_boundary, true);
+	ret = uart_framed_sleep_until(initial_boundary, true, message);
 	if (ret)
 		goto out_end;
 
@@ -1522,7 +1539,7 @@ static int uart_framed_execute(struct uart_port *uport,
 		u64 after_ns;
 		u64 wire_ns;
 
-		if (signal_pending(current)) {
+		if (uart_framed_message_interrupted(message)) {
 			ret = message->header.completed_transfers ? -EINTR :
 								   -ERESTARTSYS;
 			break;
@@ -1538,14 +1555,14 @@ static int uart_framed_execute(struct uart_port *uport,
 		}
 		uart_framed_rs485_delays(uport, &before_ns, &after_ns);
 
-		ret = uart_framed_prepare_frame(uport, deadline);
+		ret = uart_framed_prepare_frame(uport, deadline, message);
 		if (ret) {
 			if (ret == -ERESTARTSYS &&
 			    message->header.completed_transfers)
 				ret = -EINTR;
 			break;
 		}
-		if (signal_pending(current)) {
+		if (uart_framed_message_interrupted(message)) {
 			ret = message->header.completed_transfers ? -EINTR :
 								   -ERESTARTSYS;
 			goto abort_frame;
@@ -1570,7 +1587,7 @@ static int uart_framed_execute(struct uart_port *uport,
 		}
 
 		prepare_boundary = ktime_add_ns(ktime_get(), before_ns);
-		ret = uart_framed_sleep_until(prepare_boundary, true);
+		ret = uart_framed_sleep_until(prepare_boundary, true, message);
 		if (ret) {
 			if (message->header.completed_transfers)
 				ret = -EINTR;
@@ -1594,10 +1611,10 @@ static int uart_framed_execute(struct uart_port *uport,
 					      UART_MSG_FRAME_SLACK_NS);
 		if (ktime_after(frame_deadline, deadline))
 			frame_deadline = deadline;
-		uart_framed_sleep_until(completion_estimate, false);
+		uart_framed_sleep_until(completion_estimate, false, message);
 
 		ret = uart_framed_wait_empty(uport, frame_deadline, false,
-					     false);
+					     false, message);
 		if (ret) {
 			safe_boundary = false;
 			break;
@@ -1613,13 +1630,13 @@ static int uart_framed_execute(struct uart_port *uport,
 			boundary = finish_boundary;
 
 		/* A started frame always reaches its safe boundary before return. */
-		uart_framed_sleep_until(finish_boundary, false);
+		uart_framed_sleep_until(finish_boundary, false, message);
 		ret = uart_framed_finish_frame(uport);
 		if (ret) {
 			safe_boundary = false;
 			break;
 		}
-		uart_framed_sleep_until(boundary, false);
+		uart_framed_sleep_until(boundary, false, message);
 		message->header.completed_transfers++;
 		message->header.completed_bytes += transfer->len;
 		if (ktime_after(boundary, deadline)) {
@@ -1669,10 +1686,9 @@ static int uart_get_framed_caps(struct uart_state *state, void __user *user)
 	return copy_to_user(user, &caps, sizeof(caps)) ? -EFAULT : 0;
 }
 
-static int uart_write_framed_message(struct tty_struct *tty,
-				     struct serial_ioc_message __user *user)
+static int uart_framed_message_write(struct tty_struct *tty,
+				     struct uart_framed_message *message)
 {
-	struct uart_framed_message message = {};
 	struct uart_state *state = tty->driver_data;
 	struct tty_ldisc *ldisc = NULL;
 	struct uart_port *uport;
@@ -1682,13 +1698,13 @@ static int uart_write_framed_message(struct tty_struct *tty,
 	bool write_locked = false;
 	int ret;
 
-	ret = uart_framed_message_copy(user, &message);
-	if (ret)
-		goto out_free;
-
 	ldisc = tty_ldisc_ref_wait(tty);
 	if (!ldisc) {
 		ret = -EIO;
+		goto out_unlock;
+	}
+	if (uart_framed_message_interrupted(message)) {
+		ret = -ERESTARTSYS;
 		goto out_unlock;
 	}
 	if (ldisc->ops->num != N_TTY) {
@@ -1700,6 +1716,10 @@ static int uart_write_framed_message(struct tty_struct *tty,
 	if (ret)
 		goto out_unlock;
 	write_locked = true;
+	if (uart_framed_message_interrupted(message)) {
+		ret = -ERESTARTSYS;
+		goto out_unlock;
+	}
 
 	ret = down_read_killable(&tty->termios_rwsem);
 	if (ret) {
@@ -1707,18 +1727,20 @@ static int uart_write_framed_message(struct tty_struct *tty,
 		goto out_unlock;
 	}
 	termios_locked = true;
-	if (L_TOSTOP(tty)) {
-		ret = tty_check_change(tty);
-		if (ret)
-			goto out_unlock;
+	if (uart_framed_message_interrupted(message)) {
+		ret = -ERESTARTSYS;
+		goto out_unlock;
 	}
-
 	ret = mutex_lock_interruptible(&state->port.mutex);
 	if (ret) {
 		ret = -ERESTARTSYS;
 		goto out_unlock;
 	}
 	port_locked = true;
+	if (uart_framed_message_interrupted(message)) {
+		ret = -ERESTARTSYS;
+		goto out_unlock;
+	}
 
 	uport = uart_port_check(state);
 	if (!uport || tty_io_error(tty)) {
@@ -1726,7 +1748,7 @@ static int uart_write_framed_message(struct tty_struct *tty,
 		goto out_unlock;
 	}
 
-	ret = uart_framed_preflight(tty, uport, &message);
+	ret = uart_framed_preflight(tty, uport, message);
 	if (ret)
 		goto out_unlock;
 
@@ -1735,12 +1757,12 @@ static int uart_write_framed_message(struct tty_struct *tty,
 		goto out_unlock;
 	pm_active = true;
 
-	if (signal_pending(current)) {
+	if (uart_framed_message_interrupted(message)) {
 		ret = -ERESTARTSYS;
 		goto out_unlock;
 	}
 
-	ret = uart_framed_execute(uport, &message);
+	ret = uart_framed_execute(uport, message);
 
 out_unlock:
 	if (pm_active) {
@@ -1756,6 +1778,27 @@ out_unlock:
 	if (ldisc)
 		tty_ldisc_deref(ldisc);
 
+	return ret;
+}
+
+static int uart_write_framed_message(struct tty_struct *tty,
+				     struct serial_ioc_message __user *user)
+{
+	struct uart_framed_message message = {};
+	int ret;
+
+	ret = uart_framed_message_copy(user, &message);
+	if (ret)
+		goto out_free;
+
+	if (L_TOSTOP(tty)) {
+		ret = tty_check_change(tty);
+		if (ret)
+			goto out_copy;
+	}
+
+	ret = uart_framed_message_write(tty, &message);
+out_copy:
 	if (copy_to_user(user, &message.header, sizeof(message.header)))
 		ret = -EFAULT;
 
@@ -1763,6 +1806,192 @@ out_free:
 	uart_framed_message_free(&message);
 	return ret;
 }
+
+#ifdef CONFIG_IO_URING
+struct uart_uring_cmd_ctx {
+	struct work_struct work;
+	struct io_uring_cmd *cmd;
+	struct tty_struct *tty;
+	struct serial_ioc_message __user *user;
+	struct uart_framed_message message;
+	spinlock_t lock; /* Protects task and finished. */
+	struct task_struct *task;
+	atomic_t cancelled;
+	bool finished;
+	int ret;
+};
+
+struct uart_uring_cmd_pdu {
+	struct uart_uring_cmd_ctx *context;
+};
+
+static void uart_uring_cmd_finish(struct io_uring_cmd *cmd,
+				  struct uart_uring_cmd_ctx *context,
+				  bool cancelled)
+{
+	int ret = context->ret;
+
+	if (cancelled)
+		ret = -ECANCELED;
+	else if (copy_to_user(context->user, &context->message.header,
+			      sizeof(context->message.header)))
+		ret = -EFAULT;
+
+	io_uring_cmd_done(cmd, ret, IO_URING_CMD_TASK_WORK_ISSUE_FLAGS);
+	uart_framed_message_free(&context->message);
+	tty_kref_put(context->tty);
+	kfree(context);
+}
+
+static void uart_uring_cmd_complete(struct io_tw_req tw_req,
+				    io_tw_token_t tw)
+{
+	struct io_uring_cmd *cmd = io_uring_cmd_from_tw(tw_req);
+	struct uart_uring_cmd_pdu *pdu =
+		io_uring_cmd_to_pdu(cmd, struct uart_uring_cmd_pdu);
+
+	uart_uring_cmd_finish(cmd, pdu->context, tw.cancel);
+}
+
+static void uart_uring_cmd_start(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	struct io_uring_cmd *cmd = io_uring_cmd_from_tw(tw_req);
+	struct uart_uring_cmd_pdu *pdu =
+		io_uring_cmd_to_pdu(cmd, struct uart_uring_cmd_pdu);
+	struct uart_uring_cmd_ctx *context = pdu->context;
+	int ret = 0;
+
+	if (tw.cancel)
+		atomic_set(&context->cancelled, 1);
+	if (atomic_read(&context->cancelled)) {
+		ret = -ECANCELED;
+	} else if (L_TOSTOP(context->tty)) {
+		ret = tty_check_change(context->tty);
+		if (ret == -ERESTARTSYS)
+			ret = -EINTR;
+	}
+
+	if (!ret) {
+		queue_work(system_dfl_long_wq, &context->work);
+		return;
+	}
+
+	context->ret = ret;
+	spin_lock(&context->lock);
+	context->finished = true;
+	spin_unlock(&context->lock);
+	uart_uring_cmd_finish(cmd, context, tw.cancel);
+}
+
+static void uart_uring_cmd_work(struct work_struct *work)
+{
+	struct uart_uring_cmd_ctx *context =
+		container_of(work, struct uart_uring_cmd_ctx, work);
+	bool cancelled;
+
+	spin_lock(&context->lock);
+	cancelled = atomic_read(&context->cancelled);
+	if (!cancelled)
+		context->task = current;
+	spin_unlock(&context->lock);
+
+	if (cancelled) {
+		context->ret = -ECANCELED;
+	} else {
+		context->message.cancelled = &context->cancelled;
+		context->ret = uart_framed_message_write(context->tty,
+							 &context->message);
+		if (context->ret == -ERESTARTSYS)
+			context->ret = -EINTR;
+	}
+
+	spin_lock(&context->lock);
+	context->task = NULL;
+	context->finished = true;
+	spin_unlock(&context->lock);
+
+	io_uring_cmd_complete_in_task(context->cmd, uart_uring_cmd_complete);
+}
+
+static int uart_uring_cmd_cancel(struct io_uring_cmd *cmd)
+{
+	struct uart_uring_cmd_pdu *pdu =
+		io_uring_cmd_to_pdu(cmd, struct uart_uring_cmd_pdu);
+	struct uart_uring_cmd_ctx *context = pdu->context;
+	struct task_struct *task = NULL;
+	int ret = 0;
+
+	if (!context)
+		return -ENOENT;
+
+	spin_lock(&context->lock);
+	if (context->finished) {
+		ret = -EALREADY;
+	} else {
+		atomic_set(&context->cancelled, 1);
+		task = context->task;
+		if (task)
+			get_task_struct(task);
+	}
+	spin_unlock(&context->lock);
+
+	if (task) {
+		wake_up_process(task);
+		put_task_struct(task);
+	}
+
+	return ret;
+}
+
+static int uart_uring_cmd(struct tty_struct *tty, struct io_uring_cmd *cmd,
+			  unsigned int issue_flags)
+{
+	const struct io_uring_sqe *sqe = cmd->sqe;
+	struct uart_uring_cmd_pdu *pdu =
+		io_uring_cmd_to_pdu(cmd, struct uart_uring_cmd_pdu);
+	struct uart_uring_cmd_ctx *context;
+	struct serial_ioc_message __user *user;
+	int ret;
+
+	if (issue_flags & IO_URING_F_CANCEL)
+		return uart_uring_cmd_cancel(cmd);
+	if (cmd->cmd_op != SERIAL_URING_CMD_WRITE_MSG)
+		return -EOPNOTSUPP;
+	if (READ_ONCE(sqe->ioprio) || READ_ONCE(sqe->len) ||
+	    READ_ONCE(sqe->uring_cmd_flags) || READ_ONCE(sqe->buf_index) ||
+	    READ_ONCE(sqe->file_index) || READ_ONCE(sqe->addr3) ||
+	    READ_ONCE(sqe->__pad2[0]))
+		return -EINVAL;
+	if (issue_flags & IO_URING_F_NONBLOCK)
+		return -EAGAIN;
+
+	user = u64_to_user_ptr(READ_ONCE(sqe->addr));
+	context = kzalloc_obj(*context);
+	if (!context)
+		return -ENOMEM;
+
+	ret = uart_framed_message_copy(user, &context->message);
+	if (ret)
+		goto out_free;
+
+	INIT_WORK(&context->work, uart_uring_cmd_work);
+	spin_lock_init(&context->lock);
+	atomic_set(&context->cancelled, 0);
+	context->cmd = cmd;
+	context->tty = tty_kref_get(tty);
+	context->user = user;
+	pdu->context = context;
+	io_uring_cmd_mark_cancelable(cmd, issue_flags);
+	io_uring_cmd_complete_in_task(cmd, uart_uring_cmd_start);
+
+	return -EIOCBQUEUED;
+
+out_free:
+	uart_framed_message_free(&context->message);
+	kfree(context);
+	return ret;
+}
+#endif
 
 /**
  * uart_get_lsr_info - get line status register info
@@ -3398,6 +3627,9 @@ static const struct tty_operations uart_ops = {
 	.chars_in_buffer= uart_chars_in_buffer,
 	.flush_buffer	= uart_flush_buffer,
 	.ioctl		= uart_ioctl,
+#ifdef CONFIG_IO_URING
+	.uring_cmd	= uart_uring_cmd,
+#endif
 	.throttle	= uart_throttle,
 	.unthrottle	= uart_unthrottle,
 	.send_xchar	= uart_send_xchar,
