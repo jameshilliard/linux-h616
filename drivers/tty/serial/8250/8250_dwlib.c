@@ -231,8 +231,22 @@ void dw8250_setup_port(struct uart_port *p)
 		reg = pd->cpr_value;
 		dev_dbg(p->dev, "CPR is not available, using 0x%08x instead\n", reg);
 	}
-	if (!reg)
+	if (!reg) {
+		/*
+		 * Some integrations do not expose CPR.  A firmware-provided FIFO
+		 * size is authoritative, so keep it instead of letting generic
+		 * 8250 autoconfiguration replace it with the 16-byte 16550A
+		 * default.
+		 */
+		if (p->fifosize) {
+			p->type = PORT_16550A;
+			p->flags |= UPF_FIXED_TYPE;
+			up->capabilities |= UART_CAP_FIFO;
+			up->tx_loadsz = p->fifosize;
+		}
+
 		return;
+	}
 
 	/* Select the type based on FIFO */
 	if (reg & DW_UART_CPR_FIFO_MODE) {
