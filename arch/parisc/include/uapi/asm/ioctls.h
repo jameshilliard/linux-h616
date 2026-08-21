@@ -64,6 +64,8 @@
 #define TIOCGPTPEER	_IO('T', 0x41) /* Safely open the slave */
 #define TIOCGISO7816	_IOR('T', 0x42, struct serial_iso7816)
 #define TIOCSISO7816	_IOWR('T', 0x43, struct serial_iso7816)
+#define TIOCGSERMSGCAPS	_IOR('T', 0x44, struct serial_ioc_message_caps)
+#define TIOCSERWRITEMSG	_IOWR('T', 0x45, struct serial_ioc_message)
 
 #define FIONCLEX	0x5450  /* these numbers need to be adjusted. */
 #define FIOCLEX		0x5451

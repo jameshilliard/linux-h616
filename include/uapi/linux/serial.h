@@ -186,4 +186,50 @@ struct serial_iso7816 {
 	__u32	reserved[5];
 };
 
+/*
+ * Serial framed transmit message interface.
+ *
+ * A transfer describes one complete, opaque frame.  Drivers advertising this
+ * interface guarantee that the frame can be queued to hardware without an
+ * additional idle gap between its characters.  Timing values are in
+ * nanoseconds.
+ */
+#define SERIAL_MSG_ABI_VERSION	1
+
+/* serial_ioc_message_caps.flags */
+#define SERIAL_MSG_CAP_RS485	_BITUL(0)
+
+struct serial_ioc_transfer {
+	__aligned_u64	tx_buf;
+	__u32		len;
+	__u32		flags;
+	__aligned_u64	guard_ns;
+	__aligned_u64	min_interval_ns;
+	__aligned_u64	reserved[2];
+};
+
+struct serial_ioc_message {
+	__u32		version;
+	__u32		flags;
+	__aligned_u64	transfers;
+	__u32		transfer_count;
+	__u32		completed_transfers;
+	__aligned_u64	completed_bytes;
+	__aligned_u64	initial_guard_ns;
+	__aligned_u64	timeout_ns;
+	__aligned_u64	reserved[4];
+};
+
+struct serial_ioc_message_caps {
+	__u32		version;
+	__u32		flags;
+	__u32		max_transfers;
+	__u32		max_frame_bytes;
+	__aligned_u64	max_message_bytes;
+	__aligned_u64	max_guard_ns;
+	__aligned_u64	max_interval_ns;
+	__aligned_u64	max_timeout_ns;
+	__aligned_u64	reserved[3];
+};
+
 #endif /* _UAPI_LINUX_SERIAL_H */
