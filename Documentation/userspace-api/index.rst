@@ -52,6 +52,7 @@ Devices and I/O
    iommufd
    media/index
    dcdbas
+   serial-framed-tx
    vduse
    isapnp
 
