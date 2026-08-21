@@ -232,6 +232,17 @@ enum tty_driver_subtype {
  *
  *	Optional.
  *
+ * @uring_cmd: ``int ()(struct tty_struct *tty, struct io_uring_cmd *cmd,
+ *			 unsigned int issue_flags)``
+ *
+ *	Handle an :c:macro:`IORING_OP_URING_CMD` submitted on a TTY file.
+ *	When %IO_URING_F_NONBLOCK is set, the callback must not sleep. Return
+ *	%-EAGAIN to have io_uring reissue the command from a blocking context.
+ *	Cancelable commands are reissued with %IO_URING_F_CANCEL and must arrange
+ *	for their eventual asynchronous completion.
+ *
+ *	Optional: called only if provided, otherwise %-EOPNOTSUPP is returned.
+ *
  * @set_termios: ``void ()(struct tty_struct *tty, const struct ktermios *old)``
  *
  *	This routine allows the @tty driver to be notified when device's
@@ -462,6 +473,10 @@ struct tty_operations {
 		    unsigned int cmd, unsigned long arg);
 	long (*compat_ioctl)(struct tty_struct *tty,
 			     unsigned int cmd, unsigned long arg);
+#ifdef CONFIG_IO_URING
+	int (*uring_cmd)(struct tty_struct *tty, struct io_uring_cmd *cmd,
+			 unsigned int issue_flags);
+#endif
 	void (*set_termios)(struct tty_struct *tty, const struct ktermios *old);
 	void (*throttle)(struct tty_struct * tty);
 	void (*unthrottle)(struct tty_struct * tty);

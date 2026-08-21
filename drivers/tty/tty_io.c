@@ -90,6 +90,9 @@
 #include <linux/ppp-ioctl.h>
 #include <linux/proc_fs.h>
 #include <linux/init.h>
+#ifdef CONFIG_IO_URING
+#include <linux/io_uring/cmd.h>
+#endif
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/wait.h>
@@ -443,6 +446,20 @@ static long hung_up_tty_compat_ioctl(struct file *file,
 	return cmd == TIOCSPGRP ? -ENOTTY : -EIO;
 }
 
+#ifdef CONFIG_IO_URING
+static int hung_up_tty_uring_cmd(struct io_uring_cmd *cmd,
+				 unsigned int issue_flags)
+{
+	struct tty_struct *tty = file_tty(cmd->file);
+
+	/* Let an in-flight command observe cancellation after a hangup. */
+	if ((issue_flags & IO_URING_F_CANCEL) && tty && tty->ops->uring_cmd)
+		return tty->ops->uring_cmd(tty, cmd, issue_flags);
+
+	return -EIO;
+}
+#endif
+
 static int hung_up_tty_fasync(int fd, struct file *file, int on)
 {
 	return -ENOTTY;
@@ -456,6 +473,21 @@ static void tty_show_fdinfo(struct seq_file *m, struct file *file)
 		tty->ops->show_fdinfo(tty, m);
 }
 
+#ifdef CONFIG_IO_URING
+static int tty_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
+{
+	struct file *file = cmd->file;
+	struct tty_struct *tty = file_tty(file);
+
+	if (tty_paranoia_check(tty, file_inode(file), "tty_uring_cmd"))
+		return -EINVAL;
+	if (!tty->ops->uring_cmd)
+		return -EOPNOTSUPP;
+
+	return tty->ops->uring_cmd(tty, cmd, issue_flags);
+}
+#endif
+
 static const struct file_operations tty_fops = {
 	.read_iter	= tty_read,
 	.write_iter	= tty_write,
@@ -464,6 +496,9 @@ static const struct file_operations tty_fops = {
 	.poll		= tty_poll,
 	.unlocked_ioctl	= tty_ioctl,
 	.compat_ioctl	= tty_compat_ioctl,
+#ifdef CONFIG_IO_URING
+	.uring_cmd	= tty_uring_cmd,
+#endif
 	.open		= tty_open,
 	.release	= tty_release,
 	.fasync		= tty_fasync,
@@ -489,6 +524,9 @@ static const struct file_operations hung_up_tty_fops = {
 	.poll		= hung_up_tty_poll,
 	.unlocked_ioctl	= hung_up_tty_ioctl,
 	.compat_ioctl	= hung_up_tty_compat_ioctl,
+#ifdef CONFIG_IO_URING
+	.uring_cmd	= hung_up_tty_uring_cmd,
+#endif
 	.release	= tty_release,
 	.fasync		= hung_up_tty_fasync,
 };
