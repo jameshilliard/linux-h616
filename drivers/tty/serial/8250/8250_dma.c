@@ -4,12 +4,25 @@
  *
  * Copyright (C) 2013 Intel Corporation
  */
+#include <linux/dma-mapping.h>
+#include <linux/serial_reg.h>
+#include <linux/string.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
-#include <linux/serial_reg.h>
-#include <linux/dma-mapping.h>
 
 #include "8250.h"
+
+static void __dma_tx_frame_complete(void *param)
+{
+	struct uart_8250_port *p = param;
+	struct uart_8250_dma *dma = p->dma;
+	unsigned long flags;
+
+	uart_port_lock_irqsave(&p->port, &flags);
+	dma->tx_size = 0;
+	dma->tx_running = 0;
+	uart_port_unlock_irqrestore(&p->port, flags);
+}
 
 static void __dma_tx_complete(void *param)
 {
@@ -147,6 +160,54 @@ int serial8250_tx_dma(struct uart_8250_port *p)
 err:
 	dma->tx_err = 1;
 	return ret;
+}
+
+int serial8250_tx_dma_frame(struct uart_8250_port *p, const u8 *buf,
+			    size_t len, ktime_t *start)
+{
+	struct uart_8250_dma *dma = p->dma;
+	struct dma_async_tx_descriptor *desc;
+	dma_cookie_t cookie;
+
+	lockdep_assert_held_once(&p->port.lock);
+
+	if (!dma || !dma->txchan || !dma->framed_tx_buf)
+		return -EOPNOTSUPP;
+	if (!len || len > dma->framed_tx_size)
+		return -EMSGSIZE;
+	if (dma->tx_running)
+		return -EBUSY;
+
+	memcpy(dma->framed_tx_buf, buf, len);
+	dma->tx_size = len;
+	serial8250_do_prepare_tx_dma(p);
+
+	/* One descriptor owns the complete frame; no callback refills it. */
+	desc = dmaengine_prep_slave_single(dma->txchan, dma->framed_tx_addr,
+					   len, DMA_MEM_TO_DEV,
+					   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+	if (!desc)
+		goto err;
+
+	desc->callback = __dma_tx_frame_complete;
+	desc->callback_param = p;
+	cookie = dmaengine_submit(desc);
+	if (dma_submit_error(cookie))
+		goto err;
+
+	dma->tx_cookie = cookie;
+	dma->tx_running = 1;
+	dma->tx_err = 0;
+	p->port.icount.tx += len;
+	*start = ktime_get();
+	dma_async_issue_pending(dma->txchan);
+
+	return 0;
+
+err:
+	dma->tx_size = 0;
+	dma->tx_err = 1;
+	return -EBUSY;
 }
 
 void serial8250_tx_dma_flush(struct uart_8250_port *p)
@@ -305,6 +366,28 @@ int serial8250_request_dma(struct uart_8250_port *p)
 		goto err;
 	}
 
+	/*
+	 * Ordinary writers may fill xmit_fifo while a framed message owns the
+	 * transmitter, so a framed DMA transfer cannot borrow the xmit buffer.
+	 * Allocate independent storage only for front ends which opted in to
+	 * framed transmission. Failure leaves their FIFO-sized PIO path intact.
+	 */
+	if (p->port.framed_tx_max) {
+		size_t size = min_t(size_t, UART_XMIT_SIZE,
+				    dma_get_max_seg_size(dma->txchan->device->dev));
+
+		dma->framed_tx_buf = dma_alloc_coherent(dma->txchan->device->dev,
+							size,
+							&dma->framed_tx_addr,
+							GFP_KERNEL);
+		if (dma->framed_tx_buf) {
+			dma->framed_tx_size = size;
+			dma->framed_tx_pio_max = p->port.framed_tx_max;
+			p->port.framed_tx_max =
+				max_t(unsigned int, p->port.framed_tx_max, size);
+		}
+	}
+
 	dev_dbg_ratelimited(p->port.dev, "got both dma channels\n");
 
 	return 0;
@@ -333,6 +416,15 @@ void serial8250_release_dma(struct uart_8250_port *p)
 
 	/* Release TX resources */
 	dmaengine_terminate_sync(dma->txchan);
+	if (dma->framed_tx_buf) {
+		p->port.framed_tx_max = dma->framed_tx_pio_max;
+		dma_free_coherent(dma->txchan->device->dev,
+				  dma->framed_tx_size, dma->framed_tx_buf,
+				  dma->framed_tx_addr);
+		dma->framed_tx_buf = NULL;
+		dma->framed_tx_size = 0;
+		dma->framed_tx_pio_max = 0;
+	}
 	dma_unmap_single(dma->txchan->device->dev, dma->tx_addr,
 			 UART_XMIT_SIZE, DMA_TO_DEVICE);
 	dma_release_channel(dma->txchan);

@@ -1893,6 +1893,7 @@ static int serial8250_write_frame(struct uart_port *port, const u8 *buf,
 				  size_t len, ktime_t *start)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
+	size_t dma_max = serial8250_tx_dma_frame_size(up);
 	u16 lsr;
 	size_t i;
 
@@ -1905,7 +1906,8 @@ static int serial8250_write_frame(struct uart_port *port, const u8 *buf,
 	    (up->bugs & UART_BUG_TXRACE) ||
 	    (up->lcr & UART_LCR_SBC))
 		return -EOPNOTSUPP;
-	if (!len || len > port->framed_tx_max || len > up->tx_loadsz)
+	if (!len || len > port->framed_tx_max ||
+	    (len > dma_max && len > up->tx_loadsz))
 		return -EMSGSIZE;
 	/* A configured TX DMA channel is safe only after its transfer drains. */
 	if (serial8250_tx_dma_running(up) || port->x_char)
@@ -1918,6 +1920,8 @@ static int serial8250_write_frame(struct uart_port *port, const u8 *buf,
 		return -EIO;
 	if (!uart_lsr_tx_empty(lsr))
 		return -EBUSY;
+	if (len <= dma_max)
+		return serial8250_tx_dma_frame(up, buf, len, start);
 
 	*start = ktime_get();
 	for (i = 0; i < len; i++)

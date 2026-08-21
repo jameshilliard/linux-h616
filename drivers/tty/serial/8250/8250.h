@@ -39,14 +39,18 @@ struct uart_8250_dma {
 	/* DMA address of the buffer in memory */
 	dma_addr_t		rx_addr;
 	dma_addr_t		tx_addr;
+	dma_addr_t		framed_tx_addr;
 
 	dma_cookie_t		rx_cookie;
 	dma_cookie_t		tx_cookie;
 
 	void			*rx_buf;
+	void			*framed_tx_buf;
 
 	size_t			rx_size;
 	size_t			tx_size;
+	size_t			framed_tx_size;
+	unsigned int		framed_tx_pio_max;
 
 	unsigned char		tx_running;
 	unsigned char		tx_err;
@@ -374,6 +378,8 @@ static inline int is_omap1510_8250(struct uart_8250_port *pt)
 
 #ifdef CONFIG_SERIAL_8250_DMA
 extern int serial8250_tx_dma(struct uart_8250_port *);
+int serial8250_tx_dma_frame(struct uart_8250_port *p, const u8 *buf,
+			    size_t len, ktime_t *start);
 extern void serial8250_tx_dma_flush(struct uart_8250_port *);
 extern int serial8250_rx_dma(struct uart_8250_port *);
 extern void serial8250_rx_dma_flush(struct uart_8250_port *);
@@ -403,6 +409,13 @@ static inline bool serial8250_tx_dma_running(struct uart_8250_port *p)
 	return dma && dma->tx_running;
 }
 
+static inline size_t serial8250_tx_dma_frame_size(struct uart_8250_port *p)
+{
+	struct uart_8250_dma *dma = p->dma;
+
+	return dma && dma->framed_tx_buf ? dma->framed_tx_size : 0;
+}
+
 static inline void serial8250_tx_dma_pause(struct uart_8250_port *p)
 {
 	struct uart_8250_dma *dma = p->dma;
@@ -427,6 +440,13 @@ static inline int serial8250_tx_dma(struct uart_8250_port *p)
 {
 	return -1;
 }
+
+static inline int serial8250_tx_dma_frame(struct uart_8250_port *p,
+					  const u8 *buf, size_t len,
+					  ktime_t *start)
+{
+	return -EOPNOTSUPP;
+}
 static inline void serial8250_tx_dma_flush(struct uart_8250_port *p) { }
 static inline int serial8250_rx_dma(struct uart_8250_port *p)
 {
@@ -442,6 +462,11 @@ static inline void serial8250_release_dma(struct uart_8250_port *p) { }
 static inline bool serial8250_tx_dma_running(struct uart_8250_port *p)
 {
 	return false;
+}
+
+static inline size_t serial8250_tx_dma_frame_size(struct uart_8250_port *p)
+{
+	return 0;
 }
 
 static inline void serial8250_tx_dma_pause(struct uart_8250_port *p) { }
