@@ -52,6 +52,8 @@
 #define DW_UART_QUIRK_CPR_VALUE		BIT(5)
 #define DW_UART_QUIRK_IER_KICK		BIT(6)
 
+#define DW_UART_FRAMED_TX_MAX		256U
+
 /*
  * Number of consecutive IIR_NO_INT interrupts required to trigger interrupt
  * storm prevention code.
@@ -758,6 +760,13 @@ static int dw8250_probe(struct platform_device *pdev)
 
 	if (!data->skip_autocfg)
 		dw8250_setup_port(p);
+	if (data->pdata && !data->pdata->quirks &&
+	    up->capabilities & UART_CAP_FIFO &&
+	    !(up->capabilities & (UART_CAP_HFIFO | UART_CAP_MINI |
+				  UART_CAP_RPM)) &&
+	    !(up->bugs & UART_BUG_TXRACE) && p->fifosize && up->tx_loadsz)
+		p->framed_tx_max = min3(p->fifosize, up->tx_loadsz,
+					DW_UART_FRAMED_TX_MAX);
 
 	/* If we have a valid fifosize, try hooking up DMA */
 	if (p->fifosize) {
