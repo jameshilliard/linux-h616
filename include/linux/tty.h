@@ -401,6 +401,9 @@ static inline struct tty_struct *tty_kref_get(struct tty_struct *tty)
 
 const char *tty_driver_name(const struct tty_struct *tty);
 void tty_wait_until_sent(struct tty_struct *tty, long timeout);
+int tty_check_change(struct tty_struct *tty);
+int tty_write_lock(struct tty_struct *tty, bool ndelay);
+void tty_write_unlock(struct tty_struct *tty);
 void stop_tty(struct tty_struct *tty);
 void start_tty(struct tty_struct *tty);
 void tty_write_message(struct tty_struct *tty, char *msg);

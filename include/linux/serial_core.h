@@ -11,6 +11,7 @@
 #include <linux/compiler.h>
 #include <linux/console.h>
 #include <linux/interrupt.h>
+#include <linux/ktime.h>
 #include <linux/lockdep.h>
 #include <linux/printk.h>
 #include <linux/spinlock.h>
@@ -49,6 +50,54 @@ struct gpio_desc;
  *	Locking: none.
  *	Interrupts: caller dependent.
  *	This call must not sleep
+ *
+ * @write_frame: ``int ()(struct uart_port *port, const u8 *buf, size_t len,
+ *			     ktime_t *start)``
+ *
+ *	Write one complete frame to an empty hardware transmitter. Drivers
+ *	implementing this operation must make all @len bytes available to the
+ *	hardware without an additional idle gap between characters. Serial core
+ *	has stopped ordinary transmission before calling this operation. Return
+ *	an error without writing any bytes if the guarantee cannot be met.
+ *	On success, store the time immediately before the first byte is made
+ *	available to the hardware in @start.
+ *
+ *	Locking: @port->lock taken.
+ *	Interrupts: locally disabled.
+ *	This call must not sleep
+ *
+ * @prepare_frame: ``int ()(struct uart_port *port)``
+ *
+ *	Prepare the RS-485 direction control before @write_frame. Serial core
+ *	waits the configured @port->rs485.delay_rts_before_send after this call.
+ *	It calls @finish_frame to unwind every successful preparation unless
+ *	transmitter-empty cannot be established. Errors must leave hardware state
+ *	unchanged. Return -EAGAIN when completion handling from an earlier
+ *	transmission is still in progress and the operation can be retried.
+ *
+ *	This operation is optional except when framed transmit is used with
+ *	RS-485 enabled.
+ *
+ *	Locking: @port->state->port.mutex taken, @port->lock not taken.
+ *	Interrupts: enabled.
+ *	This call may sleep
+ *
+ * @finish_frame: ``int ()(struct uart_port *port)``
+ *
+ *	Release the RS-485 direction control after a successful @prepare_frame.
+ *	For a transmitted frame, serial core first observes physical
+ *	transmitter-empty and waits @port->rs485.delay_rts_after_send. If no
+ *	byte was committed, this operation is called immediately. It is
+ *	deliberately not called when physical completion cannot be established.
+ *	Return 0 on success or a negative error code if the controls cannot be
+ *	released safely.
+ *
+ *	This operation is optional except when framed transmit is used with
+ *	RS-485 enabled.
+ *
+ *	Locking: @port->state->port.mutex taken, @port->lock not taken.
+ *	Interrupts: enabled.
+ *	This call may sleep
  *
  * @set_mctrl: ``void ()(struct uart_port *port, unsigned int mctrl)``
  *
@@ -374,6 +423,10 @@ struct gpio_desc;
  */
 struct uart_ops {
 	unsigned int	(*tx_empty)(struct uart_port *);
+	int		(*write_frame)(struct uart_port *port, const u8 *buf,
+				       size_t len, ktime_t *start);
+	int		(*prepare_frame)(struct uart_port *port);
+	int		(*finish_frame)(struct uart_port *port);
 	void		(*set_mctrl)(struct uart_port *, unsigned int mctrl);
 	unsigned int	(*get_mctrl)(struct uart_port *);
 	void		(*stop_tx)(struct uart_port *);
@@ -571,6 +624,7 @@ struct uart_port {
 	bool			cons_flow;		/* user specified console flow control */
 	unsigned int		mctrl;			/* current modem ctrl settings */
 	unsigned int		frame_time;		/* frame timing in ns */
+	unsigned int		framed_tx_max;		/* maximum atomic TX frame */
 	unsigned int		type;			/* port type */
 	const struct uart_ops	*ops;
 	unsigned int		custom_divisor;
@@ -597,6 +651,9 @@ struct uart_port {
 	struct gpio_desc	*rs485_term_gpio;	/* enable RS485 bus termination */
 	struct gpio_desc	*rs485_rx_during_tx_gpio; /* Output GPIO that sets the state of RS485 RX during TX */
 	struct serial_iso7816   iso7816;
+	bool			framed_tx_reserved;	/* protected by port lock */
+	bool			framed_tx_active;	/* protected by port lock */
+	unsigned char		framed_tx_x_char;	/* deferred priority char */
 	void			*private_data;		/* generic platform data pointer */
 };
 
@@ -1148,6 +1205,9 @@ int uart_resume_port(struct uart_driver *reg, struct uart_port *port);
 static inline int uart_tx_stopped(struct uart_port *port)
 {
 	struct tty_struct *tty = port->state->port.tty;
+
+	if (READ_ONCE(port->framed_tx_active))
+		return 1;
 	if ((tty && tty->flow.stopped) || port->hw_stopped)
 		return 1;
 	return 0;

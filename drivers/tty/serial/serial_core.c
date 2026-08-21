@@ -15,8 +15,10 @@
 #include <linux/init.h>
 #include <linux/console.h>
 #include <linux/gpio/consumer.h>
+#include <linux/hrtimer.h>
 #include <linux/kernel.h>
 #include <linux/of.h>
+#include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -51,6 +53,16 @@ static struct lock_class_key port_lock_key;
  * Max time with active RTS before/after data is sent.
  */
 #define RS485_MAX_RTS_DELAY	100 /* msecs */
+
+#define UART_MSG_MAX_TRANSFERS		1024U
+#define UART_MSG_MAX_BYTES		SZ_1M
+#define UART_MSG_MAX_DELAY_NS		NSEC_PER_SEC
+#define UART_MSG_MAX_TIMEOUT_NS		(60ULL * NSEC_PER_SEC)
+#define UART_MSG_DEFAULT_SLACK_NS	NSEC_PER_SEC
+#define UART_MSG_FRAME_SLACK_NS		NSEC_PER_SEC
+#define UART_MSG_BUSY_WAIT_NS		(10ULL * NSEC_PER_USEC)
+#define UART_MSG_FAST_POLL_NS		(50ULL * NSEC_PER_USEC)
+#define UART_MSG_MAX_POLL_NS		NSEC_PER_MSEC
 
 static void uart_change_pm(struct uart_state *state,
 			   enum uart_pm_state pm_state);
@@ -129,7 +141,7 @@ static void uart_stop(struct tty_struct *tty)
 	unsigned long flags;
 
 	port = uart_port_ref_lock(state, &flags);
-	if (port)
+	if (port && !port->framed_tx_active)
 		port->ops->stop_tx(port);
 	uart_port_unlock_deref(port, flags);
 }
@@ -140,7 +152,8 @@ static void __uart_start(struct uart_state *state)
 	struct serial_port_device *port_dev;
 	int err;
 
-	if (!port || port->flags & UPF_DEAD || uart_tx_stopped(port))
+	if (!port || port->flags & UPF_DEAD || port->framed_tx_active ||
+	    uart_tx_stopped(port))
 		return;
 
 	port_dev = port->port_dev;
@@ -396,8 +409,14 @@ static void uart_shutdown(struct tty_struct *tty, struct uart_state *state)
 	if (tty)
 		set_bit(TTY_IO_ERROR, &tty->flags);
 
-	if (uport)
+	if (uport) {
+		scoped_guard(uart_port_lock_irqsave, uport) {
+			uport->framed_tx_reserved = false;
+			uport->framed_tx_active = false;
+			uport->framed_tx_x_char = 0;
+		}
 		serial_base_port_shutdown(uport);
+	}
 
 	if (tty_port_initialized(port)) {
 		tty_port_set_initialized(port, false);
@@ -679,7 +698,8 @@ static void uart_flush_buffer(struct tty_struct *tty)
 	if (!port)
 		return;
 	kfifo_reset(&state->port.xmit_fifo);
-	if (port->ops->flush_buffer)
+	/* A flush must not truncate a frame already committed to hardware. */
+	if (port->ops->flush_buffer && !port->framed_tx_active)
 		port->ops->flush_buffer(port);
 	uart_port_unlock_deref(port, flags);
 	tty_port_tty_wakeup(&state->port);
@@ -712,12 +732,16 @@ static void uart_send_xchar(struct tty_struct *tty, u8 ch)
 	if (!port)
 		return;
 
-	if (port->ops->send_xchar)
+	if (port->ops->send_xchar) {
 		port->ops->send_xchar(port, ch);
-	else {
+	} else {
 		guard(uart_port_lock_irqsave)(port);
-		port->x_char = ch;
-		if (ch)
+		if (port->framed_tx_reserved || port->framed_tx_active)
+			port->framed_tx_x_char = ch;
+		else
+			port->x_char = ch;
+		if (ch && !port->framed_tx_reserved &&
+		    !port->framed_tx_active)
 			port->ops->start_tx(port);
 	}
 	uart_port_deref(port);
@@ -1044,6 +1068,700 @@ static int uart_set_info_user(struct tty_struct *tty, struct serial_struct *ss)
 	 */
 	guard(mutex)(&port->mutex);
 	return uart_set_info(tty, port, state, ss);
+}
+
+struct uart_framed_transfer {
+	const u8 *tx_buf;
+	u32 len;
+	u64 guard_ns;
+	u64 min_interval_ns;
+};
+
+struct uart_framed_message {
+	struct serial_ioc_message header;
+	struct uart_framed_transfer *transfers;
+	u8 *tx_buf;
+	size_t total_bytes;
+};
+
+static void uart_framed_message_free(struct uart_framed_message *message)
+{
+	kvfree(message->tx_buf);
+	kfree(message->transfers);
+}
+
+static int uart_framed_message_copy(struct serial_ioc_message __user *user,
+				    struct uart_framed_message *message)
+{
+	struct serial_ioc_transfer *user_transfers;
+	struct uart_framed_transfer *transfer;
+	void __user *transfers;
+	size_t total = 0;
+	u8 *tx_buf;
+	unsigned int i;
+	int ret = 0;
+
+	if (copy_from_user(&message->header, user, sizeof(message->header)))
+		return -EFAULT;
+
+	if (message->header.version != SERIAL_MSG_ABI_VERSION ||
+	    message->header.flags ||
+	    memchr_inv(message->header.reserved, 0,
+		       sizeof(message->header.reserved)))
+		return -EINVAL;
+	if (!message->header.transfers || !message->header.transfer_count)
+		return -EINVAL;
+	if (message->header.transfer_count > UART_MSG_MAX_TRANSFERS)
+		return -EMSGSIZE;
+	if (message->header.initial_guard_ns > UART_MSG_MAX_DELAY_NS ||
+	    message->header.timeout_ns > UART_MSG_MAX_TIMEOUT_NS)
+		return -EINVAL;
+
+	transfers = u64_to_user_ptr(message->header.transfers);
+	user_transfers = memdup_array_user(transfers, message->header.transfer_count,
+					   sizeof(*user_transfers));
+	if (IS_ERR(user_transfers))
+		return PTR_ERR(user_transfers);
+
+	message->transfers = kcalloc(message->header.transfer_count,
+				     sizeof(*message->transfers), GFP_KERNEL);
+	if (!message->transfers) {
+		ret = -ENOMEM;
+		goto out_free_user_transfers;
+	}
+
+	for (i = 0; i < message->header.transfer_count; i++) {
+		struct serial_ioc_transfer *user_transfer = &user_transfers[i];
+
+		if (!user_transfer->tx_buf || !user_transfer->len ||
+		    user_transfer->flags ||
+		    user_transfer->guard_ns > UART_MSG_MAX_DELAY_NS ||
+		    user_transfer->min_interval_ns > UART_MSG_MAX_DELAY_NS ||
+		    memchr_inv(user_transfer->reserved, 0,
+			       sizeof(user_transfer->reserved))) {
+			ret = -EINVAL;
+			goto out_free_user_transfers;
+		}
+		if (check_add_overflow(total, (size_t)user_transfer->len,
+				       &total) || total > UART_MSG_MAX_BYTES ||
+		    total > INT_MAX) {
+			ret = -EMSGSIZE;
+			goto out_free_user_transfers;
+		}
+	}
+
+	message->tx_buf = kvmalloc(total, GFP_KERNEL);
+	if (!message->tx_buf) {
+		ret = -ENOMEM;
+		goto out_free_user_transfers;
+	}
+
+	tx_buf = message->tx_buf;
+	for (i = 0; i < message->header.transfer_count; i++) {
+		struct serial_ioc_transfer *user_transfer = &user_transfers[i];
+
+		transfer = &message->transfers[i];
+		transfer->tx_buf = tx_buf;
+		transfer->len = user_transfer->len;
+		transfer->guard_ns = user_transfer->guard_ns;
+		transfer->min_interval_ns = user_transfer->min_interval_ns;
+
+		if (copy_from_user(tx_buf, u64_to_user_ptr(user_transfer->tx_buf),
+				   user_transfer->len)) {
+			ret = -EFAULT;
+			goto out_free_user_transfers;
+		}
+		tx_buf += user_transfer->len;
+	}
+
+	message->total_bytes = total;
+	message->header.completed_transfers = 0;
+	message->header.completed_bytes = 0;
+
+out_free_user_transfers:
+	kfree(user_transfers);
+	return ret;
+}
+
+static int uart_framed_sleep_until(ktime_t expires, bool interruptible)
+{
+	for (;;) {
+		ktime_t now = ktime_get();
+		s64 remaining_ns = ktime_to_ns(ktime_sub(expires, now));
+
+		if (remaining_ns <= 0)
+			return 0;
+		if (interruptible && signal_pending(current))
+			return -ERESTARTSYS;
+
+		if (remaining_ns <= UART_MSG_BUSY_WAIT_NS) {
+			ndelay(remaining_ns);
+			continue;
+		}
+
+		set_current_state(interruptible ? TASK_INTERRUPTIBLE :
+						  TASK_UNINTERRUPTIBLE);
+		if (interruptible && signal_pending(current)) {
+			__set_current_state(TASK_RUNNING);
+			return -ERESTARTSYS;
+		}
+		schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
+	}
+}
+
+static int uart_framed_software_empty(struct uart_port *uport)
+{
+	int empty;
+
+	scoped_guard(uart_port_lock_irqsave, uport) {
+		if (uart_tx_stopped(uport))
+			return -EBUSY;
+		empty = !uport->x_char &&
+			kfifo_is_empty(&uport->state->port.xmit_fifo);
+		if (!empty)
+			uport->ops->start_tx(uport);
+	}
+
+	return empty;
+}
+
+static int uart_framed_wait_empty(struct uart_port *uport, ktime_t deadline,
+				  bool include_software, bool interruptible)
+{
+	ktime_t fast_poll_end = ktime_add_ns(ktime_get(),
+					    UART_MSG_FAST_POLL_NS);
+
+	for (;;) {
+		int software_empty = 1;
+		u64 min_poll_ns;
+		u64 poll_ns;
+		ktime_t now;
+		s64 remaining_ns;
+		ktime_t next;
+
+		if (include_software)
+			software_empty = uart_framed_software_empty(uport);
+		if (software_empty < 0)
+			return software_empty;
+		if (software_empty &&
+		    (uport->ops->tx_empty(uport) & TIOCSER_TEMT))
+			return 0;
+		if (interruptible && signal_pending(current))
+			return -ERESTARTSYS;
+
+		now = ktime_get();
+		remaining_ns = ktime_to_ns(ktime_sub(deadline, now));
+		if (remaining_ns <= 0)
+			return -ETIMEDOUT;
+
+		min_poll_ns = !include_software &&
+			      ktime_before(now, fast_poll_end) ? 1 :
+			      UART_MSG_FAST_POLL_NS;
+		poll_ns = clamp_t(u64, uport->frame_time,
+				  min_poll_ns, UART_MSG_MAX_POLL_NS);
+		next = ktime_add_ns(now, min_t(u64, poll_ns, remaining_ns));
+		if (uart_framed_sleep_until(next, interruptible))
+			return -ERESTARTSYS;
+	}
+}
+
+static void uart_framed_rs485_delays(const struct uart_port *uport,
+				     u64 *before_ns, u64 *after_ns)
+{
+	*before_ns = 0;
+	*after_ns = 0;
+	if (!(uport->rs485.flags & SER_RS485_ENABLED))
+		return;
+
+	*before_ns = (u64)uport->rs485.delay_rts_before_send * NSEC_PER_MSEC;
+	*after_ns = (u64)uport->rs485.delay_rts_after_send * NSEC_PER_MSEC;
+}
+
+static u64 uart_framed_default_timeout(struct uart_port *uport,
+				       const struct uart_framed_message *message)
+{
+	u64 duration = message->header.initial_guard_ns;
+	u64 before_ns;
+	u64 after_ns;
+	unsigned int i;
+
+	uart_framed_rs485_delays(uport, &before_ns, &after_ns);
+
+	for (i = 0; i < message->header.transfer_count; i++) {
+		const struct uart_framed_transfer *transfer =
+			&message->transfers[i];
+		u64 wire_ns;
+		u64 boundary_ns;
+
+		if (check_mul_overflow((u64)uport->frame_time,
+				       (u64)transfer->len, &wire_ns) ||
+		    check_add_overflow(wire_ns,
+				       max(transfer->guard_ns, after_ns),
+				       &boundary_ns))
+			return UART_MSG_MAX_TIMEOUT_NS;
+		boundary_ns = max(boundary_ns, transfer->min_interval_ns);
+		if (check_add_overflow(boundary_ns, before_ns, &boundary_ns) ||
+		    check_add_overflow(duration, boundary_ns, &duration))
+			return UART_MSG_MAX_TIMEOUT_NS;
+	}
+
+	if (check_add_overflow(duration, UART_MSG_DEFAULT_SLACK_NS, &duration))
+		return UART_MSG_MAX_TIMEOUT_NS;
+
+	return min(duration, UART_MSG_MAX_TIMEOUT_NS);
+}
+
+static bool uart_framed_supported(const struct uart_port *uport)
+{
+	return uport->ops->write_frame && uport->ops->tx_empty &&
+	       !uport->ops->send_xchar && uport->framed_tx_max;
+}
+
+static bool uart_framed_rs485_supported(const struct uart_port *uport)
+{
+	return uport->ops->prepare_frame && uport->ops->finish_frame;
+}
+
+static int uart_framed_preflight(struct tty_struct *tty,
+				 struct uart_port *uport,
+				 const struct uart_framed_message *message)
+{
+	unsigned int i;
+	bool stopped;
+
+	if (!tty_port_initialized(&uport->state->port) || !uport->port_dev ||
+	    uport->suspended || uport->flags & UPF_DEAD)
+		return -EIO;
+	if (!uart_framed_supported(uport))
+		return -EOPNOTSUPP;
+	if (uart_console_registered(uport) ||
+	    uport->iso7816.flags & SER_ISO7816_ENABLED)
+		return -EOPNOTSUPP;
+	if (uport->rs485.flags & SER_RS485_ENABLED) {
+		if (!uart_framed_rs485_supported(uport) ||
+		    uport->rs485.flags & SER_RS485_ADDRB)
+			return -EOPNOTSUPP;
+	}
+	if ((tty->termios.c_iflag & (IXON | IXOFF | IXANY)) ||
+	    (tty->termios.c_cflag & CRTSCTS) || !uport->frame_time)
+		return -EOPNOTSUPP;
+
+	scoped_guard(spinlock_irqsave, &tty->flow.lock)
+		stopped = tty->flow.stopped;
+	if (stopped)
+		return -EBUSY;
+
+	scoped_guard(uart_port_lock_irqsave, uport) {
+		if (uport->hw_stopped || uport->framed_tx_reserved ||
+		    uport->framed_tx_active)
+			return -EBUSY;
+	}
+
+	for (i = 0; i < message->header.transfer_count; i++)
+		if (message->transfers[i].len > uport->framed_tx_max)
+			return -EMSGSIZE;
+
+	return 0;
+}
+
+static int uart_framed_reserve(struct uart_port *uport)
+{
+	guard(uart_port_lock_irqsave)(uport);
+
+	if (uport->framed_tx_reserved || uport->framed_tx_active)
+		return -EBUSY;
+	uport->framed_tx_reserved = true;
+
+	return 0;
+}
+
+static int uart_framed_begin(struct uart_port *uport)
+{
+	guard(uart_port_lock_irqsave)(uport);
+
+	if (!uport->framed_tx_reserved || uport->framed_tx_active)
+		return -EBUSY;
+	if (uart_tx_stopped(uport))
+		return -EBUSY;
+	if (uport->x_char ||
+	    !kfifo_is_empty(&uport->state->port.xmit_fifo))
+		return -EAGAIN;
+
+	uport->framed_tx_reserved = false;
+	uport->framed_tx_active = true;
+	uport->ops->stop_tx(uport);
+
+	return 0;
+}
+
+static int uart_framed_prepare_frame(struct uart_port *uport,
+				     ktime_t deadline)
+{
+	if (!(uport->rs485.flags & SER_RS485_ENABLED))
+		return 0;
+
+	for (;;) {
+		ktime_t now;
+		ktime_t retry;
+		u64 retry_ns;
+		int ret;
+
+		ret = uport->ops->prepare_frame(uport);
+		if (ret != -EAGAIN)
+			return ret;
+		if (signal_pending(current))
+			return -ERESTARTSYS;
+
+		now = ktime_get();
+		if (!ktime_before(now, deadline))
+			return -ETIMEDOUT;
+		retry_ns = clamp_t(u64, uport->frame_time,
+				   UART_MSG_FAST_POLL_NS, UART_MSG_MAX_POLL_NS);
+		retry = ktime_add_ns(now, retry_ns);
+		if (ktime_after(retry, deadline))
+			retry = deadline;
+		ret = uart_framed_sleep_until(retry, true);
+		if (ret)
+			return ret;
+	}
+}
+
+static int uart_framed_finish_frame(struct uart_port *uport)
+{
+	if (!(uport->rs485.flags & SER_RS485_ENABLED))
+		return 0;
+
+	return uport->ops->finish_frame(uport);
+}
+
+static void uart_framed_end(struct uart_port *uport, bool safe_boundary)
+{
+	guard(uart_port_lock_irqsave)(uport);
+
+	/*
+	 * Keep the port exclusively owned if the transmitter failed to reach a
+	 * physical boundary. Closing and reopening the port performs recovery;
+	 * allowing normal output here could append it to an incomplete frame.
+	 */
+	if (!safe_boundary)
+		return;
+
+	uport->framed_tx_reserved = false;
+	uport->framed_tx_active = false;
+	if (uport->framed_tx_x_char) {
+		uport->x_char = uport->framed_tx_x_char;
+		uport->framed_tx_x_char = 0;
+	}
+
+	if (uport->x_char)
+		uport->ops->start_tx(uport);
+	else if (uart_tx_stopped(uport))
+		uport->ops->stop_tx(uport);
+	else if (!kfifo_is_empty(&uport->state->port.xmit_fifo))
+		uport->ops->start_tx(uport);
+}
+
+static int uart_framed_execute(struct uart_port *uport,
+			       struct uart_framed_message *message)
+{
+	u64 timeout_ns = message->header.timeout_ns;
+	ktime_t deadline;
+	ktime_t initial_boundary;
+	bool safe_boundary = true;
+	unsigned int i;
+	int ret;
+
+	if (!timeout_ns)
+		timeout_ns = uart_framed_default_timeout(uport, message);
+	deadline = ktime_add_ns(ktime_get(), timeout_ns);
+
+	ret = uart_framed_reserve(uport);
+	if (ret)
+		return ret;
+
+	for (;;) {
+		ret = uart_framed_wait_empty(uport, deadline, true, true);
+		if (ret)
+			goto out_end;
+
+		ret = uart_framed_begin(uport);
+		if (ret != -EAGAIN)
+			break;
+	}
+	if (ret)
+		goto out_end;
+
+	/* Close the race between observing TEMT and claiming the port. */
+	ret = uart_framed_wait_empty(uport, deadline, false, true);
+	if (ret)
+		goto out_end;
+
+	initial_boundary = ktime_add_ns(ktime_get(), message->header.initial_guard_ns);
+	if (ktime_after(initial_boundary, deadline)) {
+		ret = -ETIMEDOUT;
+		goto out_end;
+	}
+	ret = uart_framed_sleep_until(initial_boundary, true);
+	if (ret)
+		goto out_end;
+
+	for (i = 0; i < message->header.transfer_count; i++) {
+		struct uart_framed_transfer *transfer = &message->transfers[i];
+		ktime_t completion_estimate;
+		ktime_t frame_deadline;
+		ktime_t prepare_boundary;
+		ktime_t interval_boundary;
+		ktime_t guard_boundary;
+		ktime_t finish_boundary;
+		ktime_t boundary;
+		ktime_t temt;
+		ktime_t start;
+		u64 frame_duration_ns;
+		u64 safe_duration_ns;
+		u64 before_ns;
+		u64 after_ns;
+		u64 wire_ns;
+
+		if (signal_pending(current)) {
+			ret = message->header.completed_transfers ? -EINTR :
+								   -ERESTARTSYS;
+			break;
+		}
+		if (!ktime_before(ktime_get(), deadline)) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (check_mul_overflow((u64)uport->frame_time,
+				       (u64)transfer->len, &wire_ns)) {
+			ret = -EOVERFLOW;
+			break;
+		}
+		uart_framed_rs485_delays(uport, &before_ns, &after_ns);
+
+		ret = uart_framed_prepare_frame(uport, deadline);
+		if (ret) {
+			if (ret == -ERESTARTSYS &&
+			    message->header.completed_transfers)
+				ret = -EINTR;
+			break;
+		}
+		if (signal_pending(current)) {
+			ret = message->header.completed_transfers ? -EINTR :
+								   -ERESTARTSYS;
+			goto abort_frame;
+		}
+		if (check_add_overflow(wire_ns,
+				       max(transfer->guard_ns, after_ns),
+				       &frame_duration_ns)) {
+			ret = -EOVERFLOW;
+			goto abort_frame;
+		}
+		frame_duration_ns = max(frame_duration_ns,
+					transfer->min_interval_ns);
+		if (check_add_overflow(before_ns, frame_duration_ns,
+				       &safe_duration_ns)) {
+			ret = -EOVERFLOW;
+			goto abort_frame;
+		}
+		if (ktime_after(ktime_add_ns(ktime_get(), safe_duration_ns),
+				deadline)) {
+			ret = -ETIMEDOUT;
+			goto abort_frame;
+		}
+
+		prepare_boundary = ktime_add_ns(ktime_get(), before_ns);
+		ret = uart_framed_sleep_until(prepare_boundary, true);
+		if (ret) {
+			if (message->header.completed_transfers)
+				ret = -EINTR;
+			goto abort_frame;
+		}
+		if (ktime_after(ktime_add_ns(ktime_get(), frame_duration_ns),
+				deadline)) {
+			ret = -ETIMEDOUT;
+			goto abort_frame;
+		}
+
+		scoped_guard(uart_port_lock_irqsave, uport) {
+			ret = uport->ops->write_frame(uport, transfer->tx_buf,
+						      transfer->len, &start);
+		}
+		if (ret)
+			goto abort_frame;
+
+		completion_estimate = ktime_add_ns(start, wire_ns);
+		frame_deadline = ktime_add_ns(completion_estimate,
+					      UART_MSG_FRAME_SLACK_NS);
+		if (ktime_after(frame_deadline, deadline))
+			frame_deadline = deadline;
+		uart_framed_sleep_until(completion_estimate, false);
+
+		ret = uart_framed_wait_empty(uport, frame_deadline, false,
+					     false);
+		if (ret) {
+			safe_boundary = false;
+			break;
+		}
+
+		temt = ktime_get();
+		guard_boundary = ktime_add_ns(temt, transfer->guard_ns);
+		finish_boundary = ktime_add_ns(temt, after_ns);
+		interval_boundary = ktime_add_ns(start, transfer->min_interval_ns);
+		boundary = ktime_after(guard_boundary, interval_boundary) ?
+			   guard_boundary : interval_boundary;
+		if (ktime_after(finish_boundary, boundary))
+			boundary = finish_boundary;
+
+		/* A started frame always reaches its safe boundary before return. */
+		uart_framed_sleep_until(finish_boundary, false);
+		ret = uart_framed_finish_frame(uport);
+		if (ret) {
+			safe_boundary = false;
+			break;
+		}
+		uart_framed_sleep_until(boundary, false);
+		message->header.completed_transfers++;
+		message->header.completed_bytes += transfer->len;
+		if (ktime_after(boundary, deadline)) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+		continue;
+
+abort_frame:
+		if (uart_framed_finish_frame(uport))
+			safe_boundary = false;
+		break;
+	}
+
+	if (i == message->header.transfer_count)
+		ret = message->total_bytes;
+
+out_end:
+	uart_framed_end(uport, safe_boundary);
+	return ret;
+}
+
+static int uart_get_framed_caps(struct uart_state *state, void __user *user)
+{
+	struct serial_ioc_message_caps caps = {
+		.version = SERIAL_MSG_ABI_VERSION,
+		.max_transfers = UART_MSG_MAX_TRANSFERS,
+		.max_message_bytes = UART_MSG_MAX_BYTES,
+		.max_guard_ns = UART_MSG_MAX_DELAY_NS,
+		.max_interval_ns = UART_MSG_MAX_DELAY_NS,
+		.max_timeout_ns = UART_MSG_MAX_TIMEOUT_NS,
+	};
+	struct uart_port *uport;
+
+	scoped_guard(mutex, &state->port.mutex) {
+		uport = uart_port_check(state);
+		if (!uport || !uart_framed_supported(uport))
+			return -EOPNOTSUPP;
+		caps.max_frame_bytes = min_t(unsigned int,
+					     uport->framed_tx_max,
+					     UART_MSG_MAX_BYTES);
+		if (uart_framed_rs485_supported(uport) &&
+		    uport->rs485_supported.flags & SER_RS485_ENABLED)
+			caps.flags |= SERIAL_MSG_CAP_RS485;
+	}
+
+	return copy_to_user(user, &caps, sizeof(caps)) ? -EFAULT : 0;
+}
+
+static int uart_write_framed_message(struct tty_struct *tty,
+				     struct serial_ioc_message __user *user)
+{
+	struct uart_framed_message message = {};
+	struct uart_state *state = tty->driver_data;
+	struct tty_ldisc *ldisc = NULL;
+	struct uart_port *uport;
+	bool pm_active = false;
+	bool termios_locked = false;
+	bool port_locked = false;
+	bool write_locked = false;
+	int ret;
+
+	ret = uart_framed_message_copy(user, &message);
+	if (ret)
+		goto out_free;
+
+	ldisc = tty_ldisc_ref_wait(tty);
+	if (!ldisc) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+	if (ldisc->ops->num != N_TTY) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	ret = tty_write_lock(tty, false);
+	if (ret)
+		goto out_unlock;
+	write_locked = true;
+
+	ret = down_read_killable(&tty->termios_rwsem);
+	if (ret) {
+		ret = -ERESTARTSYS;
+		goto out_unlock;
+	}
+	termios_locked = true;
+	if (L_TOSTOP(tty)) {
+		ret = tty_check_change(tty);
+		if (ret)
+			goto out_unlock;
+	}
+
+	ret = mutex_lock_interruptible(&state->port.mutex);
+	if (ret) {
+		ret = -ERESTARTSYS;
+		goto out_unlock;
+	}
+	port_locked = true;
+
+	uport = uart_port_check(state);
+	if (!uport || tty_io_error(tty)) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
+	ret = uart_framed_preflight(tty, uport, &message);
+	if (ret)
+		goto out_unlock;
+
+	ret = pm_runtime_resume_and_get(&uport->port_dev->dev);
+	if (ret < 0)
+		goto out_unlock;
+	pm_active = true;
+
+	if (signal_pending(current)) {
+		ret = -ERESTARTSYS;
+		goto out_unlock;
+	}
+
+	ret = uart_framed_execute(uport, &message);
+
+out_unlock:
+	if (pm_active) {
+		pm_runtime_mark_last_busy(&uport->port_dev->dev);
+		pm_runtime_put_autosuspend(&uport->port_dev->dev);
+	}
+	if (port_locked)
+		mutex_unlock(&state->port.mutex);
+	if (termios_locked)
+		up_read(&tty->termios_rwsem);
+	if (write_locked)
+		tty_write_unlock(tty);
+	if (ldisc)
+		tty_ldisc_deref(ldisc);
+
+	if (copy_to_user(user, &message.header, sizeof(message.header)))
+		ret = -EFAULT;
+
+out_free:
+	uart_framed_message_free(&message);
+	return ret;
 }
 
 /**
@@ -1563,6 +2281,10 @@ uart_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
 
 	if (tty_io_error(tty))
 		return -EIO;
+	if (cmd == TIOCGSERMSGCAPS)
+		return uart_get_framed_caps(state, uarg);
+	if (cmd == TIOCSERWRITEMSG)
+		return uart_write_framed_message(tty, uarg);
 
 	/* This should only be used when the hardware is present. */
 	if (cmd == TIOCMIWAIT)

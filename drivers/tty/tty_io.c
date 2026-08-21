@@ -933,6 +933,7 @@ void tty_write_unlock(struct tty_struct *tty)
 	mutex_unlock(&tty->atomic_write_lock);
 	wake_up_interruptible_poll(&tty->write_wait, EPOLLOUT);
 }
+EXPORT_SYMBOL_GPL(tty_write_unlock);
 
 int tty_write_lock(struct tty_struct *tty, bool ndelay)
 {
@@ -944,6 +945,7 @@ int tty_write_lock(struct tty_struct *tty, bool ndelay)
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(tty_write_lock);
 
 /*
  * Split writes up in sane blocksizes to avoid
@@ -2909,6 +2911,8 @@ static long tty_compat_ioctl(struct file *file, unsigned int cmd,
 #endif
 	case TIOCGSOFTCAR:
 	case TIOCSSOFTCAR:
+	case TIOCGSERMSGCAPS:
+	case TIOCSERWRITEMSG:
 
 	case PPPIOCGCHAN:
 	case PPPIOCGUNIT:
