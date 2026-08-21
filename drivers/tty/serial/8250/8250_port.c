@@ -1889,6 +1889,92 @@ static int serial8250_tx_threshold_handle_irq(struct uart_port *port)
 	return serial8250_handle_irq(port, iir);
 }
 
+static int serial8250_write_frame(struct uart_port *port, const u8 *buf,
+				  size_t len, ktime_t *start)
+{
+	struct uart_8250_port *up = up_to_u8250p(port);
+	u16 lsr;
+	size_t i;
+
+	lockdep_assert_held_once(&port->lock);
+
+	if (!(up->capabilities & UART_CAP_FIFO) ||
+	    !(up->fcr & UART_FCR_ENABLE_FIFO) ||
+	    (up->capabilities & (UART_CAP_HFIFO | UART_CAP_MINI |
+				 UART_CAP_RPM)) ||
+	    (up->bugs & UART_BUG_TXRACE) ||
+	    (up->lcr & UART_LCR_SBC))
+		return -EOPNOTSUPP;
+	if (!len || len > port->framed_tx_max || len > up->tx_loadsz)
+		return -EMSGSIZE;
+	/* A configured TX DMA channel is safe only after its transfer drains. */
+	if (serial8250_tx_dma_running(up) || port->x_char)
+		return -EBUSY;
+
+	/* Keep deferred normal output from using a TX interrupt mid-frame. */
+	serial8250_clear_THRI(up);
+	lsr = serial_lsr_in(up);
+	if (lsr == 0xff && !(port->flags & UPF_BUGGY_UART))
+		return -EIO;
+	if (!uart_lsr_tx_empty(lsr))
+		return -EBUSY;
+
+	*start = ktime_get();
+	for (i = 0; i < len; i++)
+		serial_out(up, UART_TX, buf[i]);
+	port->icount.tx += len;
+
+	return 0;
+}
+
+static int serial8250_prepare_frame(struct uart_port *port)
+{
+	struct uart_8250_port *up = up_to_u8250p(port);
+	struct uart_8250_em485 *em485;
+
+	if (!(port->rs485.flags & SER_RS485_ENABLED) || !up->em485)
+		return 0;
+
+	guard(uart_port_lock_irqsave)(port);
+	em485 = up->em485;
+	if (em485->active_timer == &em485->stop_tx_timer)
+		return -EAGAIN;
+	if (em485->active_timer || !up->rs485_start_tx || !up->rs485_stop_tx)
+		return -EBUSY;
+
+	/* Settle an already empty ordinary transmission before taking over. */
+	if (!em485->tx_stopped) {
+		up->rs485_stop_tx(up, true);
+		em485->tx_stopped = true;
+	}
+
+	em485->tx_stopped = false;
+	up->rs485_start_tx(up, true);
+
+	return 0;
+}
+
+static int serial8250_finish_frame(struct uart_port *port)
+{
+	struct uart_8250_port *up = up_to_u8250p(port);
+	struct uart_8250_em485 *em485;
+
+	if (!(port->rs485.flags & SER_RS485_ENABLED) || !up->em485)
+		return 0;
+
+	guard(uart_port_lock_irqsave)(port);
+	em485 = up->em485;
+	if (WARN_ON_ONCE(em485->active_timer))
+		return -EBUSY;
+	if (em485->tx_stopped)
+		return 0;
+
+	up->rs485_stop_tx(up, true);
+	em485->tx_stopped = true;
+
+	return 0;
+}
+
 static unsigned int serial8250_tx_empty(struct uart_port *port)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
@@ -3160,6 +3246,9 @@ static const char *serial8250_type(struct uart_port *port)
 
 static const struct uart_ops serial8250_pops = {
 	.tx_empty	= serial8250_tx_empty,
+	.write_frame	= serial8250_write_frame,
+	.prepare_frame	= serial8250_prepare_frame,
+	.finish_frame	= serial8250_finish_frame,
 	.set_mctrl	= serial8250_set_mctrl,
 	.get_mctrl	= serial8250_get_mctrl,
 	.stop_tx	= serial8250_stop_tx,

@@ -731,6 +731,7 @@ int serial8250_register_8250_port(const struct uart_8250_port *up)
 	uart->port.irqflags     = up->port.irqflags;
 	uart->port.uartclk      = up->port.uartclk;
 	uart->port.fifosize     = up->port.fifosize;
+	uart->port.framed_tx_max = up->port.framed_tx_max;
 	uart->port.regshift     = up->port.regshift;
 	uart->port.iotype       = up->port.iotype;
 	uart->port.flags        = up->port.flags | UPF_BOOT_AUTOCONF;
