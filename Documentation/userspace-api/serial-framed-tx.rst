@@ -10,9 +10,11 @@ frame delimiter.  Ordinary ``write(2)`` boundaries do not have this meaning:
 the TTY and UART drivers may split or combine writes, and successful return
 only means that the bytes were accepted for transmission.
 
-The interface is synchronous and transmit-only.  It does not add a checksum,
-escape bytes, change the receive path, or define a protocol.  One transfer is
-one complete frame supplied by userspace.
+The ioctl is synchronous; the equivalent io_uring command completes through a
+CQE.  Both submission paths execute the same serialized, transmit-only
+operation.  They do not add a checksum, escape bytes, change the receive path,
+or define a protocol.  One transfer is one complete frame supplied by
+userspace.
 
 Availability
 ============
@@ -67,6 +69,41 @@ On success, the ioctl returns the total number of transmitted bytes.  This is
 a positive value and is limited to ``INT_MAX``.  ``completed_transfers`` and
 ``completed_bytes`` are also updated in the message header.
 
+io_uring submission
+===================
+
+The same operation is available through ``IORING_OP_URING_CMD`` from
+``<linux/io_uring.h>``.  Prepare an SQE with the serial file descriptor, set
+``cmd_op`` to ``SERIAL_URING_CMD_WRITE_MSG``, and place the userspace pointer to
+``struct serial_ioc_message`` in ``addr``.  ``ioprio``, ``len``,
+``uring_cmd_flags``, ``buf_index``, ``file_index``, ``addr3``, and ``__pad2``
+must be zero.  In particular, fixed-buffer and multishot uring commands are
+not supported by version 1.
+
+The CQE ``res`` has the same meaning as the ioctl return value, and the kernel
+copies progress to the pointed-to message header before posting the CQE.  The
+message header, descriptors, and frame buffers must remain valid and unchanged
+until that CQE is observed.  They are copied before the command changes UART
+state, so they can be reused immediately after completion.
+
+Each uring command contains one complete message and is serialized with ioctl
+submissions and ordinary writes.  Independently submitted commands have no
+additional ordering guarantee beyond that serialization.  Use one message or
+``IOSQE_IO_LINK`` when the order between batches matters.
+
+A command which has not started UART execution can be cancelled by the normal
+io_uring cancellation mechanisms and reports ``ECANCELED``.  Once it starts,
+cancellation is best effort: an interruptible wait is stopped, but a frame
+which has started is always completed through its safe boundary.  The command
+can therefore complete normally if cancellation races with its final frame,
+or report ``EINTR`` after a completed prefix.  It never reports cancellation
+by cutting a frame short.  This also applies when ``IOSQE_ASYNC`` forces the
+initial command issue through io-wq.
+
+TTY job control is checked in the submitting task before the asynchronous
+UART work starts.  The command is handed to that task before this check even
+when an ``IORING_SETUP_SQPOLL`` ring performed the initial issue.
+
 Wire timing
 ===========
 
@@ -80,7 +117,7 @@ For transfer *i*, define:
     The first observed time after the final byte has left both the hardware
     FIFO and shift register.
 
-The next frame can start, or the ioctl can return after its last frame, no
+The next frame can start, or the operation can complete after its last frame, no
 earlier than::
 
     max(temt_i + guard_ns_i, start_i + min_interval_ns_i)
@@ -102,10 +139,10 @@ When both ``SERIAL_MSG_CAP_RS485`` and ``SER_RS485_ENABLED`` are set, one
 transfer is also one RS-485 transmit burst.  The driver asserts the configured
 send direction, waits ``delay_rts_before_send``, commits the complete frame,
 waits for physical transmitter-empty, waits ``delay_rts_after_send``, and
-releases the send direction.  The next frame cannot start and the ioctl cannot
-return until both the requested timing boundary and that direction-release
-sequence have completed.  The RS-485 delays are included in a kernel-computed
-message timeout.
+releases the send direction.  The next frame cannot start and the operation
+cannot complete until both the requested timing boundary and that
+direction-release sequence have completed.  The RS-485 delays are included in
+a kernel-computed message timeout.
 
 ``guard_ns`` remains relative to physical transmitter-empty, not to direction
 release.  Consequently, the post-send delay and guard overlap; the effective
@@ -142,10 +179,11 @@ Interruption, timeout, and progress
 ===================================
 
 The initial drain and guard are interruptible.  If no frame has started, a
-signal can produce a restartable error.  Once a frame starts, the kernel waits
-uninterruptibly until that frame reaches physical transmitter-empty and both
-of its timing requirements have elapsed.  A pending signal is then reported
-as ``EINTR`` before another frame is started.
+signal can produce a restartable ioctl error; io_uring reports ``EINTR`` in its
+CQE.  Once a frame starts, the kernel waits uninterruptibly until that frame
+reaches physical transmitter-empty and both of its timing requirements have
+elapsed.  A pending signal is then reported as ``EINTR`` before another frame
+is started.
 
 ``timeout_ns`` is a whole-message deadline.  Zero selects a kernel-computed
 deadline based on the configured character time, requested delays, and a
@@ -153,9 +191,9 @@ scheduling allowance.  The deadline starts when UART execution begins, after
 the request has been copied and serialized with other writers.  The kernel
 does not start a frame which cannot be expected to reach its safe boundary by
 the deadline.  A frame which has already started is nevertheless taken to a
-safe boundary before return, so the ioctl can return slightly after the
+safe boundary before completion, so the request can finish slightly after the
 requested deadline.  If that safe boundary itself is later than the deadline,
-the completed frame is included in the progress fields and the ioctl returns
+the completed frame is included in the progress fields and the request reports
 ``ETIMEDOUT``.  A task which is scheduled after an on-time boundary does not
 retroactively time out.
 
@@ -185,12 +223,12 @@ Version 1 has these global limits in addition to the queried driver limit:
 * one second for each guard or minimum interval; and
 * 60 seconds for an explicit whole-message timeout.
 
-The ioctl currently requires the ``N_TTY`` line discipline.  It is rejected
-on a registered console and while ISO 7816, software flow control, RTS/CTS
-flow control, unsupported RS-485, or RS-485 address-bit mode is enabled.  It
-is also rejected if output is stopped, the port is suspended or unavailable,
-another framed message owns the port, or the low-level driver cannot provide
-the contiguous-frame operation.
+Both submission paths currently require the ``N_TTY`` line discipline.  They
+are rejected on a registered console and while ISO 7816, software flow
+control, RTS/CTS flow control, unsupported RS-485, or RS-485 address-bit mode
+is enabled.  They are also rejected if output is stopped, the port is
+suspended or unavailable, another framed message owns the port, or the
+low-level driver cannot provide the contiguous-frame operation.
 
 The message bypasses output post-processing: bytes in ``tx_buf`` are the bytes
 presented to the UART.  A configured transmit DMA channel does not by itself
