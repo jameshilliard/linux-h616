@@ -1021,6 +1021,9 @@ static int tc_taprio_configure(struct stmmac_priv *priv,
 		goto disable;
 	if (!priv->ptp_enabled || !priv->ptp_clock_ops.gettime64)
 		return -EOPNOTSUPP;
+	/* Unlike reset replay, a new schedule requires an accessible PHC. */
+	if (priv->ptp_blocked)
+		return -EBUSY;
 
 	if (qopt->num_entries > dep)
 		return -EINVAL;
@@ -1159,7 +1162,10 @@ static int tc_setup_taprio(struct stmmac_priv *priv,
 	switch (qopt->cmd) {
 	case TAPRIO_CMD_REPLACE:
 	case TAPRIO_CMD_DESTROY:
+		/* Serialize cache publication with PHC adjustment and reset replay. */
+		mutex_lock(&priv->ptp_mutex);
 		err = tc_taprio_configure(priv, qopt);
+		mutex_unlock(&priv->ptp_mutex);
 		break;
 	case TAPRIO_CMD_STATS:
 		tc_taprio_stats(priv, qopt);

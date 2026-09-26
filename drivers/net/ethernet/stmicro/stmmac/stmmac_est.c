@@ -91,10 +91,12 @@ int __stmmac_setup_est(struct stmmac_priv *priv, struct stmmac_est *est)
 	int err;
 
 	lockdep_assert_held(&priv->est_lock);
+	lockdep_assert_held(&priv->ptp_mutex);
 
 	if (!priv->ptp_enabled)
 		return -EOPNOTSUPP;
 
+	/* Reset replay owns ptp_mutex while public PHC reads are blocked. */
 	read_lock_irqsave(&priv->ptp_lock, flags);
 	err = stmmac_get_systime(priv, priv->ptpaddr, &now);
 	read_unlock_irqrestore(&priv->ptp_lock, flags);

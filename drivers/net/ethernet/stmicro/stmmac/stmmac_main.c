@@ -602,18 +602,24 @@ static void stmmac_get_rx_hwtstamp(struct stmmac_priv *priv, struct dma_desc *p,
 	}
 }
 
-static void stmmac_update_subsecond_increment(struct stmmac_priv *priv)
+static int stmmac_update_subsecond_increment(struct stmmac_priv *priv)
 {
 	bool xmac = dwmac_is_xmac(priv->plat->core_type);
 	u32 sec_inc = 0;
 	u64 temp = 0;
+	u32 addend;
+	int ret;
 
 	stmmac_config_hw_tstamping(priv, priv->ptpaddr, priv->systime_flags);
 
 	/* program Sub Second Increment reg */
-	stmmac_config_sub_second_increment(priv, priv->ptpaddr,
-					   priv->plat->clk_ptp_rate,
-					   xmac, &sec_inc);
+	ret = stmmac_config_sub_second_increment(priv, priv->ptpaddr,
+						 priv->plat->clk_ptp_rate,
+						 xmac, &sec_inc);
+	if (ret)
+		return ret;
+	if (!sec_inc || !priv->plat->clk_ptp_rate)
+		return -EINVAL;
 	temp = div_u64(1000000000ULL, sec_inc);
 
 	/* Store sub second increment for later use */
@@ -626,11 +632,12 @@ static void stmmac_update_subsecond_increment(struct stmmac_priv *priv)
 	 */
 	temp = (u64)(temp << 32);
 	priv->default_addend = div_u64(temp, priv->plat->clk_ptp_rate);
-	stmmac_config_addend(priv, priv->ptpaddr, priv->default_addend);
+	addend = adjust_by_scaled_ppm(priv->default_addend, priv->ptp_scaled_ppm);
+	return stmmac_config_addend(priv, priv->ptpaddr, addend);
 }
 
 /**
- *  stmmac_hwtstamp_set - control hardware timestamping.
+ *  __stmmac_hwtstamp_set - control hardware timestamping.
  *  @dev: device pointer.
  *  @config: the timestamping configuration.
  *  @extack: netlink extended ack structure for error reporting.
@@ -640,9 +647,9 @@ static void stmmac_update_subsecond_increment(struct stmmac_priv *priv)
  *  Return Value:
  *  0 on success and an appropriate -ve integer on failure.
  */
-static int stmmac_hwtstamp_set(struct net_device *dev,
-			       struct kernel_hwtstamp_config *config,
-			       struct netlink_ext_ack *extack)
+static int __stmmac_hwtstamp_set(struct net_device *dev,
+				 struct kernel_hwtstamp_config *config,
+				 struct netlink_ext_ack *extack)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 	u32 ptp_v2 = 0;
@@ -653,6 +660,7 @@ static int stmmac_hwtstamp_set(struct net_device *dev,
 	u32 snap_type_sel = 0;
 	u32 ts_master_en = 0;
 	u32 ts_event_en = 0;
+	unsigned long flags;
 
 	if (!priv->plat->clk_ptp_rate ||
 	    !(priv->dma_cap.time_stamp || priv->adv_ts)) {
@@ -814,6 +822,7 @@ static int stmmac_hwtstamp_set(struct net_device *dev,
 	priv->hwts_rx_en = config->rx_filter != HWTSTAMP_FILTER_NONE;
 	priv->hwts_tx_en = config->tx_type == HWTSTAMP_TX_ON;
 
+	write_lock_irqsave(&priv->ptp_lock, flags);
 	priv->systime_flags = STMMAC_HWTS_ACTIVE;
 	if (!priv->tsfupdt_coarse)
 		priv->systime_flags |= PTP_TCR_TSCFUPDT;
@@ -826,10 +835,25 @@ static int stmmac_hwtstamp_set(struct net_device *dev,
 	}
 
 	stmmac_config_hw_tstamping(priv, priv->ptpaddr, priv->systime_flags);
+	write_unlock_irqrestore(&priv->ptp_lock, flags);
 
 	priv->tstamp_config = *config;
 
 	return 0;
+}
+
+static int stmmac_hwtstamp_set(struct net_device *dev,
+			       struct kernel_hwtstamp_config *config,
+			       struct netlink_ext_ack *extack)
+{
+	struct stmmac_priv *priv = netdev_priv(dev);
+	int ret;
+
+	mutex_lock(&priv->ptp_mutex);
+	ret = priv->ptp_blocked ? -EBUSY :
+		__stmmac_hwtstamp_set(dev, config, extack);
+	mutex_unlock(&priv->ptp_mutex);
+	return ret;
 }
 
 /**
@@ -867,19 +891,20 @@ static int stmmac_init_tstamp_counter(struct stmmac_priv *priv,
 				      u32 systime_flags)
 {
 	struct timespec64 now;
+	int ret;
 
 	stmmac_config_hw_tstamping(priv, priv->ptpaddr, systime_flags);
 	priv->systime_flags = systime_flags;
 
-	stmmac_update_subsecond_increment(priv);
+	ret = stmmac_update_subsecond_increment(priv);
+	if (ret)
+		return ret;
 
 	/* initialize system time */
 	ktime_get_real_ts64(&now);
 
 	/* lower 32 bits of tv_sec are safe until y2106 */
-	stmmac_init_systime(priv, priv->ptpaddr, (u32)now.tv_sec, now.tv_nsec);
-
-	return 0;
+	return stmmac_init_systime(priv, priv->ptpaddr, (u32)now.tv_sec, now.tv_nsec);
 }
 
 static int stmmac_init_ptp_clk_freq(struct stmmac_priv *priv)
@@ -914,7 +939,7 @@ static int stmmac_init_timestamping(struct stmmac_priv *priv)
 	int ret;
 
 	ret = stmmac_init_tstamp_counter(priv, STMMAC_HWTS_ACTIVE |
-					       PTP_TCR_TSCFUPDT);
+				       (priv->tsfupdt_coarse ? 0 : PTP_TCR_TSCFUPDT));
 	if (ret) {
 		netdev_warn(priv->dev, "PTP init failed\n");
 		return ret;
@@ -945,7 +970,7 @@ static int stmmac_init_timestamping(struct stmmac_priv *priv)
 	return 0;
 }
 
-static int stmmac_setup_ptp(struct stmmac_priv *priv)
+static int __stmmac_setup_ptp(struct stmmac_priv *priv)
 {
 	int ret;
 
@@ -953,6 +978,11 @@ static int stmmac_setup_ptp(struct stmmac_priv *priv)
 		netdev_info(priv->dev, "PTP not supported\n");
 		return 0;
 	}
+
+	priv->ptp_scaled_ppm = 0;
+	priv->ptp_perout = 0;
+	priv->ptp_extts = 0;
+	priv->plat->flags &= ~STMMAC_FLAG_EXT_SNAPSHOT_EN;
 
 	ret = clk_prepare_enable(priv->plat->clk_ptp_ref);
 	if (ret < 0) {
@@ -979,14 +1009,68 @@ static int stmmac_setup_ptp(struct stmmac_priv *priv)
 	return 0;
 }
 
+/* ptp_mutex excludes configuration and crosstimestamp operations. The
+ * spinlock also excludes atomic gettime callers while changing this gate.
+ */
+static void stmmac_block_ptp(struct stmmac_priv *priv, bool block)
+{
+	unsigned long flags;
+
+	write_lock_irqsave(&priv->ptp_lock, flags);
+	WRITE_ONCE(priv->ptp_blocked, block);
+	write_unlock_irqrestore(&priv->ptp_lock, flags);
+}
+
 static void stmmac_release_ptp(struct stmmac_priv *priv)
 {
-	if (!priv->ptp_enabled)
+	mutex_lock(&priv->ptp_mutex);
+	if (!priv->ptp_enabled) {
+		mutex_unlock(&priv->ptp_mutex);
 		return;
+	}
+	mutex_unlock(&priv->ptp_mutex);
 
+	/* Unregister waits for clock users, including ones taking ptp_mutex,
+	 * and disables outputs. Keep powered access for those final callbacks.
+	 */
 	stmmac_ptp_unregister(priv);
-	clk_disable_unprepare(priv->plat->clk_ptp_ref);
+	mutex_lock(&priv->ptp_mutex);
+	stmmac_block_ptp(priv, true);
 	priv->ptp_enabled = false;
+	clk_disable_unprepare(priv->plat->clk_ptp_ref);
+	mutex_unlock(&priv->ptp_mutex);
+}
+
+static int stmmac_setup_ptp(struct stmmac_priv *priv)
+{
+	int ret;
+
+	mutex_lock(&priv->ptp_mutex);
+	stmmac_block_ptp(priv, true);
+	ret = __stmmac_setup_ptp(priv);
+	if (!ret)
+		stmmac_block_ptp(priv, false);
+	mutex_unlock(&priv->ptp_mutex);
+	return ret;
+}
+
+static int stmmac_restore_timestamping(struct stmmac_priv *priv)
+{
+	int ret;
+
+	if (!priv->ptp_enabled)
+		return 0;
+
+	ret = stmmac_init_ptp_clk_freq(priv);
+	if (ret)
+		return ret;
+
+	ret = stmmac_init_tstamp_counter(priv, priv->systime_flags);
+	if (ret)
+		return ret;
+	if (priv->plat->flags & STMMAC_FLAG_HWTSTAMP_CORRECT_LATENCY)
+		stmmac_hwtstamp_correct_latency(priv, priv);
+	return stmmac_ptp_restore(priv, true);
 }
 
 static void stmmac_legacy_serdes_power_down(struct stmmac_priv *priv)
@@ -4259,7 +4343,9 @@ static int __stmmac_open(struct net_device *dev,
 	/* The core soft reset in stmmac_hw_setup() clears the MTL_EST
 	 * registers, so re-apply the taprio offload after PTP is up.
 	 */
+	mutex_lock(&priv->ptp_mutex);
 	ret = stmmac_setup_est(priv);
+	mutex_unlock(&priv->ptp_mutex);
 	if (ret < 0)
 		goto est_error;
 
@@ -6421,7 +6507,8 @@ static void stmmac_common_interrupt(struct stmmac_priv *priv)
 		for (queue = 0; queue < queues_count; queue++)
 			stmmac_host_mtl_irq_status(priv, priv->hw, queue);
 
-		stmmac_timestamp_interrupt(priv, priv);
+		if (!READ_ONCE(priv->ptp_blocked))
+			stmmac_timestamp_interrupt(priv, priv);
 	}
 }
 
@@ -7854,7 +7941,25 @@ static int stmmac_dl_ts_coarse_set(struct devlink *dl, u32 id,
 {
 	struct stmmac_devlink_priv *dl_priv = devlink_priv(dl);
 	struct stmmac_priv *priv = dl_priv->stmmac_priv;
+	unsigned long flags;
+	bool old_coarse;
+	u32 old_flags;
+	int ret, restore_ret;
 
+	mutex_lock(&priv->ptp_mutex);
+	if (!priv->ptp_enabled) {
+		priv->tsfupdt_coarse = ctx->val.vbool;
+		mutex_unlock(&priv->ptp_mutex);
+		return 0;
+	}
+	if (priv->ptp_blocked) {
+		mutex_unlock(&priv->ptp_mutex);
+		return -EBUSY;
+	}
+	write_lock_irqsave(&priv->ptp_lock, flags);
+
+	old_coarse = priv->tsfupdt_coarse;
+	old_flags = priv->systime_flags;
 	priv->tsfupdt_coarse = ctx->val.vbool;
 
 	if (priv->tsfupdt_coarse)
@@ -7865,9 +7970,27 @@ static int stmmac_dl_ts_coarse_set(struct devlink *dl, u32 id,
 	/* In Coarse mode, we can use a smaller subsecond increment, let's
 	 * reconfigure the systime, subsecond increment and addend.
 	 */
-	stmmac_update_subsecond_increment(priv);
+	ret = stmmac_update_subsecond_increment(priv);
+	write_unlock_irqrestore(&priv->ptp_lock, flags);
+	if (!ret)
+		ret = stmmac_ptp_restore(priv, false);
+	if (ret) {
+		write_lock_irqsave(&priv->ptp_lock, flags);
+		priv->tsfupdt_coarse = old_coarse;
+		priv->systime_flags = old_flags;
+		restore_ret = stmmac_update_subsecond_increment(priv);
+		write_unlock_irqrestore(&priv->ptp_lock, flags);
+		if (!restore_ret)
+			restore_ret = stmmac_ptp_restore(priv, false);
+		if (restore_ret) {
+			stmmac_block_ptp(priv, true);
+			netdev_err(priv->dev, "failed restoring PHC update mode: %pe\n",
+				   ERR_PTR(restore_ret));
+		}
+	}
+	mutex_unlock(&priv->ptp_mutex);
 
-	return 0;
+	return ret;
 }
 
 static int stmmac_dl_ts_coarse_get(struct devlink *dl, u32 id,
@@ -8206,6 +8329,7 @@ static int __stmmac_dvr_probe(struct device *device,
 	mutex_init(&priv->lock);
 	mutex_init(&priv->est_lock);
 	rwlock_init(&priv->ptp_lock);
+	mutex_init(&priv->ptp_mutex);
 
 	stmmac_fpe_init(priv);
 
@@ -8403,6 +8527,9 @@ int stmmac_suspend(struct device *dev)
 		ethtool_mmsv_stop(&priv->fpe_cfg.mmsv);
 
 suspend_bsp:
+	mutex_lock(&priv->ptp_mutex);
+	stmmac_block_ptp(priv, true);
+	mutex_unlock(&priv->ptp_mutex);
 	if (priv->plat->suspend)
 		return priv->plat->suspend(dev, priv->plat->bsp_priv);
 
@@ -8511,18 +8638,14 @@ int stmmac_resume(struct device *dev)
 		goto error_unlock;
 	}
 
-	if (priv->ptp_enabled) {
-		if (stmmac_init_ptp_clk_freq(priv))
-			goto init_coalesce;
-
-		ret = stmmac_init_timestamping(priv);
-		if (ret)
-			goto error_stop_dma;
-	}
-
-init_coalesce:
-	ret = stmmac_setup_est(priv);
-	if (ret < 0)
+	mutex_lock(&priv->ptp_mutex);
+	ret = stmmac_restore_timestamping(priv);
+	if (!ret)
+		ret = stmmac_setup_est(priv);
+	if (!ret)
+		stmmac_block_ptp(priv, false);
+	mutex_unlock(&priv->ptp_mutex);
+	if (ret)
 		goto error_stop_dma;
 
 	stmmac_init_coalesce(priv);

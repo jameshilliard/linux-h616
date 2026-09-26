@@ -571,12 +571,13 @@ int dwmac1000_ptp_enable(struct ptp_clock_info *ptp,
 	    container_of(ptp, struct stmmac_priv, ptp_clock_ops);
 	void __iomem *ptpaddr = priv->ptpaddr;
 	int ret = -EOPNOTSUPP;
-	u32 tcr_val;
+	u32 tcr_val, old_tcr;
 
 	switch (rq->type) {
 	case PTP_CLK_REQ_EXTTS:
 		mutex_lock(&priv->aux_ts_lock);
 		tcr_val = readl(ptpaddr + PTP_TCR);
+		old_tcr = tcr_val & ~GMAC_PTP_TCR_ATSFC;
 
 		if (on) {
 			tcr_val |= GMAC_PTP_TCR_ATSEN0;
@@ -595,6 +596,14 @@ int dwmac1000_ptp_enable(struct ptp_clock_info *ptp,
 		ret = readl_poll_timeout(ptpaddr + PTP_TCR, tcr_val,
 					 !(tcr_val & GMAC_PTP_TCR_ATSFC),
 					 10, 10000);
+		if (ret) {
+			writel(old_tcr, ptpaddr + PTP_TCR);
+			on = !!(old_tcr & GMAC_PTP_TCR_ATSEN0);
+			if (on)
+				priv->plat->flags |= STMMAC_FLAG_EXT_SNAPSHOT_EN;
+			else
+				priv->plat->flags &= ~STMMAC_FLAG_EXT_SNAPSHOT_EN;
+		}
 
 		mutex_unlock(&priv->aux_ts_lock);
 
