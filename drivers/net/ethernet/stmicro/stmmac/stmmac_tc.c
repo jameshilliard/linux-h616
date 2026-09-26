@@ -15,12 +15,17 @@
 static int tc_config_preemption(struct stmmac_priv *priv,
 				struct netlink_ext_ack *extack, u32 preemptible_tcs)
 {
-	/* Qdisc teardown must not access unpowered registers. */
-	if (priv->hw_unavailable)
-		return 0;
+	int ret = 0;
 
-	return stmmac_fpe_map_preemption_class(priv, priv->dev, extack,
-					      preemptible_tcs);
+	/* Qdisc teardown still clears the saved mapping after failed resume. */
+	if (!priv->hw_unavailable)
+		ret = stmmac_fpe_map_preemption_class(priv, priv->dev, extack,
+						      preemptible_tcs);
+	if (!ret) {
+		priv->fpe_cfg.preemptible_tcs = preemptible_tcs;
+		priv->fpe_cfg.mapping_configured = true;
+	}
+	return ret;
 }
 
 static void tc_fill_all_pass_entry(struct stmmac_tc_entry *entry)
@@ -247,21 +252,22 @@ static int tc_setup_cls_u32(struct stmmac_priv *priv,
 
 static int tc_rfs_init(struct stmmac_priv *priv)
 {
-	int i;
+	int i, total = 0;
 
 	priv->rfs_entries_max[STMMAC_RFS_T_VLAN] = 8;
 	priv->rfs_entries_max[STMMAC_RFS_T_LLDP] = 1;
 	priv->rfs_entries_max[STMMAC_RFS_T_1588] = 1;
 
 	for (i = 0; i < STMMAC_RFS_T_MAX; i++)
-		priv->rfs_entries_total += priv->rfs_entries_max[i];
+		total += priv->rfs_entries_max[i];
 
 	priv->rfs_entries = devm_kcalloc(priv->device,
-					 priv->rfs_entries_total,
+					 total,
 					 sizeof(*priv->rfs_entries),
 					 GFP_KERNEL);
 	if (!priv->rfs_entries)
 		return -ENOMEM;
+	priv->rfs_entries_total = total;
 
 	dev_info(priv->device, "Enabled RFS Flow TC (entries=%d)\n",
 		 priv->rfs_entries_total);
@@ -275,14 +281,14 @@ static int tc_init(struct stmmac_priv *priv)
 	unsigned int count;
 	int ret, i;
 
-	priv->flow_entries_max = dma_cap->l3l4fnum;
-	if (priv->flow_entries_max) {
+	if (dma_cap->l3l4fnum) {
 		priv->flow_entries = devm_kcalloc(priv->device,
-						  priv->flow_entries_max,
+						  dma_cap->l3l4fnum,
 						  sizeof(*priv->flow_entries),
 						  GFP_KERNEL);
 		if (!priv->flow_entries)
 			return -ENOMEM;
+		priv->flow_entries_max = dma_cap->l3l4fnum;
 
 		for (i = 0; i < priv->flow_entries_max; i++)
 			priv->flow_entries[i].idx = i;
@@ -520,31 +526,15 @@ static int tc_add_ip4_flow(struct stmmac_priv *priv,
 {
 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	struct flow_dissector *dissector = rule->match.dissector;
-	bool inv = entry->action & STMMAC_FLOW_ACTION_DROP;
 	struct flow_match_ipv4_addrs match;
-	u32 hw_match;
-	int ret;
 
 	/* Nothing to do here */
 	if (!dissector_uses_key(dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS))
 		return -EINVAL;
 
 	flow_rule_match_ipv4_addrs(rule, &match);
-	hw_match = ntohl(match.key->src) & ntohl(match.mask->src);
-	if (hw_match) {
-		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, true,
-					      false, true, inv, hw_match);
-		if (ret)
-			return ret;
-	}
-
-	hw_match = ntohl(match.key->dst) & ntohl(match.mask->dst);
-	if (hw_match) {
-		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, true,
-					      false, false, inv, hw_match);
-		if (ret)
-			return ret;
-	}
+	entry->ip4_src = ntohl(match.key->src) & ntohl(match.mask->src);
+	entry->ip4_dst = ntohl(match.key->dst) & ntohl(match.mask->dst);
 
 	return 0;
 }
@@ -555,11 +545,7 @@ static int tc_add_ports_flow(struct stmmac_priv *priv,
 {
 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	struct flow_dissector *dissector = rule->match.dissector;
-	bool inv = entry->action & STMMAC_FLOW_ACTION_DROP;
 	struct flow_match_ports match;
-	u32 hw_match;
-	bool is_udp;
-	int ret;
 
 	/* Nothing to do here */
 	if (!dissector_uses_key(dissector, FLOW_DISSECTOR_KEY_PORTS))
@@ -567,10 +553,7 @@ static int tc_add_ports_flow(struct stmmac_priv *priv,
 
 	switch (entry->ip_proto) {
 	case IPPROTO_TCP:
-		is_udp = false;
-		break;
 	case IPPROTO_UDP:
-		is_udp = true;
 		break;
 	default:
 		return -EINVAL;
@@ -578,23 +561,46 @@ static int tc_add_ports_flow(struct stmmac_priv *priv,
 
 	flow_rule_match_ports(rule, &match);
 
-	hw_match = ntohs(match.key->src) & ntohs(match.mask->src);
-	if (hw_match) {
-		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, true,
-					      is_udp, true, inv, hw_match);
-		if (ret)
-			return ret;
-	}
-
-	hw_match = ntohs(match.key->dst) & ntohs(match.mask->dst);
-	if (hw_match) {
-		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, true,
-					      is_udp, false, inv, hw_match);
-		if (ret)
-			return ret;
-	}
+	entry->port_src = ntohs(match.key->src) & ntohs(match.mask->src);
+	entry->port_dst = ntohs(match.key->dst) & ntohs(match.mask->dst);
 
 	entry->is_l4 = true;
+	return 0;
+}
+
+static int tc_config_flow(struct stmmac_priv *priv,
+			  const struct stmmac_flow_entry *entry)
+{
+	bool inv = entry->action & STMMAC_FLOW_ACTION_DROP;
+	bool udp = entry->ip_proto == IPPROTO_UDP;
+	int ret;
+
+	/* Clear the whole slot, including matches removed by a replacement. */
+	ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, false,
+				      false, false, false, 0);
+	if (ret || !entry->in_use)
+		return ret;
+	if (entry->ip4_src) {
+		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, true,
+					      false, true, inv, entry->ip4_src);
+		if (ret)
+			return ret;
+	}
+	if (entry->ip4_dst) {
+		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, true,
+					      false, false, inv, entry->ip4_dst);
+		if (ret)
+			return ret;
+	}
+	if (entry->port_src) {
+		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, true,
+					    udp, true, inv, entry->port_src);
+		if (ret)
+			return ret;
+	}
+	if (entry->port_dst)
+		return stmmac_config_l4_filter(priv, priv->hw, entry->idx, true,
+					      udp, false, inv, entry->port_dst);
 	return 0;
 }
 
@@ -630,6 +636,7 @@ static int tc_add_flow(struct stmmac_priv *priv,
 {
 	struct stmmac_flow_entry *entry = tc_find_flow(priv, cls, false);
 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+	struct stmmac_flow_entry new = {};
 	int i, ret;
 
 	if (!entry) {
@@ -638,23 +645,33 @@ static int tc_add_flow(struct stmmac_priv *priv,
 			return -ENOENT;
 	}
 
-	ret = tc_parse_flow_actions(priv, &rule->action, entry,
+	new.idx = entry->idx;
+	ret = tc_parse_flow_actions(priv, &rule->action, &new,
 				    cls->common.extack);
 	if (ret)
 		return ret;
 
 	for (i = 0; i < ARRAY_SIZE(tc_flow_parsers); i++) {
-		ret = tc_flow_parsers[i].fn(priv, cls, entry);
+		ret = tc_flow_parsers[i].fn(priv, cls, &new);
 		if (!ret)
-			entry->in_use = true;
+			new.in_use = true;
 		else if (ret == -EOPNOTSUPP)
 			return ret;
 	}
 
-	if (!entry->in_use)
+	if (!new.in_use)
 		return -EINVAL;
 
-	entry->cookie = cls->cookie;
+	ret = tc_config_flow(priv, &new);
+	if (ret) {
+		/* Do not publish a rule that was only partially programmed. */
+		if (tc_config_flow(priv, entry))
+			netdev_err(priv->dev, "failed to restore flower filter %d\n",
+				   entry->idx);
+		return ret;
+	}
+	new.cookie = cls->cookie;
+	*entry = new;
 	return 0;
 }
 
@@ -700,6 +717,30 @@ static struct stmmac_rfs_entry *tc_find_rfs(struct stmmac_priv *priv,
 
 #define VLAN_PRIO_FULL_MASK (0x07)
 
+static void tc_restore_vlan_prio(struct stmmac_priv *priv)
+{
+	u8 prios[MTL_MAX_RX_QUEUES] = {};
+	int i, queue;
+
+	/* Keep board defaults separate from the runtime rules. Removing the
+	 * last rule for a priority restores its original queue assignment.
+	 */
+	for (queue = 0; queue < priv->plat->rx_queues_to_use; queue++)
+		if (priv->plat->rx_queues_cfg[queue].use_prio)
+			prios[queue] = priv->plat->rx_queues_cfg[queue].prio;
+	for (i = 0; i < priv->rfs_entries_total; i++) {
+		struct stmmac_rfs_entry *entry = &priv->rfs_entries[i];
+
+		if (!entry->in_use || entry->type != STMMAC_RFS_T_VLAN)
+			continue;
+		for (queue = 0; queue < priv->plat->rx_queues_to_use; queue++)
+			prios[queue] &= ~entry->vlan_prio;
+		prios[entry->tc] |= entry->vlan_prio;
+	}
+	for (queue = 0; queue < priv->plat->rx_queues_to_use; queue++)
+		stmmac_rx_queue_prio(priv, priv->hw, prios[queue], queue);
+}
+
 static int tc_add_vlan_flow(struct stmmac_priv *priv,
 			    struct flow_cls_offload *cls)
 {
@@ -715,7 +756,7 @@ static int tc_add_vlan_flow(struct stmmac_priv *priv,
 			return -ENOENT;
 	}
 
-	if (priv->rfs_entries_cnt[STMMAC_RFS_T_VLAN] >=
+	if (!entry->in_use && priv->rfs_entries_cnt[STMMAC_RFS_T_VLAN] >=
 	    priv->rfs_entries_max[STMMAC_RFS_T_VLAN])
 		return -ENOENT;
 
@@ -723,7 +764,7 @@ static int tc_add_vlan_flow(struct stmmac_priv *priv,
 	if (!dissector_uses_key(dissector, FLOW_DISSECTOR_KEY_VLAN))
 		return -EINVAL;
 
-	if (tc < 0) {
+	if (tc < 0 || tc >= priv->plat->rx_queues_to_use) {
 		netdev_err(priv->dev, "Invalid traffic class\n");
 		return -EINVAL;
 	}
@@ -732,6 +773,7 @@ static int tc_add_vlan_flow(struct stmmac_priv *priv,
 
 	if (match.mask->vlan_priority) {
 		u32 prio;
+		int i;
 
 		if (match.mask->vlan_priority != VLAN_PRIO_FULL_MASK) {
 			netdev_err(priv->dev, "Only full mask is supported for VLAN priority");
@@ -739,13 +781,23 @@ static int tc_add_vlan_flow(struct stmmac_priv *priv,
 		}
 
 		prio = BIT(match.key->vlan_priority);
-		stmmac_rx_queue_prio(priv, priv->hw, prio, tc);
+		for (i = 0; i < priv->rfs_entries_total; i++) {
+			struct stmmac_rfs_entry *other = &priv->rfs_entries[i];
 
+			if (other != entry && other->in_use &&
+			    other->type == STMMAC_RFS_T_VLAN &&
+			    other->vlan_prio == prio && other->tc != tc)
+				return -EEXIST;
+		}
+
+		if (!entry->in_use)
+			priv->rfs_entries_cnt[STMMAC_RFS_T_VLAN]++;
 		entry->in_use = true;
 		entry->cookie = cls->cookie;
 		entry->tc = tc;
 		entry->type = STMMAC_RFS_T_VLAN;
-		priv->rfs_entries_cnt[STMMAC_RFS_T_VLAN]++;
+		entry->vlan_prio = prio;
+		tc_restore_vlan_prio(priv);
 	}
 
 	return 0;
@@ -759,15 +811,14 @@ static int tc_del_vlan_flow(struct stmmac_priv *priv,
 	if (!entry || !entry->in_use || entry->type != STMMAC_RFS_T_VLAN)
 		return -ENOENT;
 
-	if (stmmac_tc_active(priv))
-		stmmac_rx_queue_prio(priv, priv->hw, 0, entry->tc);
-
 	entry->in_use = false;
 	entry->cookie = 0;
 	entry->tc = 0;
 	entry->type = 0;
 
 	priv->rfs_entries_cnt[STMMAC_RFS_T_VLAN]--;
+	if (stmmac_tc_active(priv))
+		tc_restore_vlan_prio(priv);
 
 	return 0;
 }
@@ -933,6 +984,47 @@ static int tc_setup_cls(struct stmmac_priv *priv,
 	}
 
 	return ret;
+}
+
+int stmmac_tc_restore_filters(struct stmmac_priv *priv)
+{
+	int i, ret;
+
+	if (priv->rfs_entries_total)
+		tc_restore_vlan_prio(priv);
+	for (i = 0; i < priv->flow_entries_max; i++) {
+		struct stmmac_flow_entry *entry = &priv->flow_entries[i];
+
+		if (!entry->in_use)
+			continue;
+		ret = tc_config_flow(priv, entry);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < priv->rfs_entries_total; i++) {
+		struct stmmac_rfs_entry *entry = &priv->rfs_entries[i];
+
+		if (!entry->in_use)
+			continue;
+		switch (entry->type) {
+		/* VLAN priorities were rebuilt from all installed rules above. */
+		case STMMAC_RFS_T_VLAN:
+			break;
+		case STMMAC_RFS_T_LLDP:
+			stmmac_rx_queue_routing(priv, priv->hw, PACKET_DCBCPQ,
+						entry->tc);
+			break;
+		case STMMAC_RFS_T_1588:
+			stmmac_rx_queue_routing(priv, priv->hw, PACKET_PTPQ,
+						entry->tc);
+			break;
+		}
+	}
+	/* The XGMAC callback also restores the runtime TC-to-queue mapping. */
+	if (priv->fpe_cfg.mapping_configured)
+		return tc_config_preemption(priv, NULL,
+					    priv->fpe_cfg.preemptible_tcs);
+	return 0;
 }
 
 struct timespec64 stmmac_calc_tas_basetime(ktime_t old_base_time,

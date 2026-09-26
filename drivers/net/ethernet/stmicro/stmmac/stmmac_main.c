@@ -3912,6 +3912,8 @@ static int stmmac_hw_setup(struct net_device *dev)
 		if (ret)
 			return ret;
 	}
+	if (stmmac_fpe_supported(priv))
+		stmmac_fpe_set_add_frag_size(priv, priv->fpe_cfg.add_frag_size);
 
 	/* Initialize Safety Features */
 	stmmac_safety_feat_configuration(priv);
@@ -3923,11 +3925,16 @@ static int stmmac_hw_setup(struct net_device *dev)
 		priv->hw->rx_csum = 0;
 	}
 
-	/* Enable the MAC Rx/Tx */
-	stmmac_mac_set(priv, priv->ioaddr, true);
-
 	/* Set the HW DMA mode and the COE */
 	stmmac_dma_operation_mode(priv);
+
+	/* DMA mode setup installs a static TC mapping on XGMAC. Replay the
+	 * runtime mapping afterwards, before either MAC or DMA can run.
+	 */
+	ret = stmmac_tc_restore_filters(priv);
+	if (ret)
+		return ret;
+	stmmac_mac_set(priv, priv->ioaddr, true);
 
 	stmmac_mmc_setup(priv);
 
@@ -3973,7 +3980,6 @@ static int stmmac_hw_setup(struct net_device *dev)
 
 		stmmac_enable_tbs(priv, priv->ioaddr, enable, chan);
 	}
-
 
 	phylink_rx_clk_stop_block(priv->phylink);
 	stmmac_set_hw_vlan_mode(priv, priv->hw);
@@ -4534,20 +4540,16 @@ static int __stmmac_open(struct net_device *dev,
 	if (ret)
 		goto init_error;
 
-	/* The core soft reset in stmmac_hw_setup() clears the MTL_EST
-	 * registers, so re-apply the taprio offload after PTP is up.
-	 */
-	mutex_lock(&priv->ptp_mutex);
-	ret = stmmac_setup_est(priv);
-	mutex_unlock(&priv->ptp_mutex);
-	if (ret < 0)
-		goto est_error;
-
 	stmmac_init_coalesce(priv);
 
 	stmmac_vlan_restore(priv);
+	mutex_lock(&priv->ptp_mutex);
+	ret = stmmac_setup_est(priv);
+	mutex_unlock(&priv->ptp_mutex);
+	if (ret)
+		goto irq_error;
 
-	/* Restore the installed schedule before starting DMA. */
+	/* All reset-sensitive offloads must be installed before DMA runs. */
 	stmmac_start_all_dma(priv);
 
 	ret = stmmac_request_irq(dev);
@@ -4576,7 +4578,6 @@ irq_error:
 	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
 		hrtimer_cancel(&priv->dma_conf->tx_queue[chan].txtimer);
 
-est_error:
 	stmmac_release_ptp(priv);
 init_error:
 	/* Undo phylink_prepare_resume() even if hardware setup failed before
@@ -9059,9 +9060,7 @@ int stmmac_resume(struct device *dev)
 
 	stmmac_vlan_restore(priv);
 
-	/* Restore the installed schedule before starting DMA. */
 	stmmac_start_all_dma(priv);
-
 	stmmac_enable_all_queues(priv);
 	stmmac_enable_all_dma_irq(priv);
 	stmmac_unmask_pci_irq(priv);
