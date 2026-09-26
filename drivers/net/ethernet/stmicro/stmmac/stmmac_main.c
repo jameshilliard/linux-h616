@@ -336,6 +336,19 @@ static void stmmac_enable_all_queues(struct stmmac_priv *priv)
 	}
 }
 
+static void stmmac_schedule_xsk(struct stmmac_priv *priv)
+{
+	u32 queue, count = min(priv->plat->rx_queues_to_use,
+			       priv->plat->tx_queues_to_use);
+
+	if (priv->datapath != STMMAC_DATAPATH_RUNNING ||
+	    !netif_device_present(priv->dev) || !netif_carrier_ok(priv->dev) ||
+	    !stmmac_xdp_is_enabled(priv))
+		return;
+	for_each_set_bit(queue, priv->af_xdp_zc_qps, count)
+		napi_schedule(&priv->channel[queue].rxtx_napi);
+}
+
 static void stmmac_service_event_schedule(struct stmmac_priv *priv)
 {
 	if (!test_bit(STMMAC_DOWN, &priv->state) &&
@@ -1893,6 +1906,7 @@ static void stmmac_free_tx_buffer(struct stmmac_priv *priv,
 
 	tx_q->tx_skbuff_dma[i].buf = 0;
 	tx_q->tx_skbuff_dma[i].map_as_page = false;
+	tx_q->tx_skbuff_dma[i].buf_type = STMMAC_TXBUF_T_SKB;
 }
 
 /**
@@ -2039,17 +2053,19 @@ static int __init_dma_rx_desc_rings(struct stmmac_priv *priv,
 	rx_q->xsk_pool = stmmac_get_xsk_pool(priv, queue);
 
 	if (rx_q->xsk_pool) {
-		WARN_ON(xdp_rxq_info_reg_mem_model(&rx_q->xdp_rxq,
-						   MEM_TYPE_XSK_BUFF_POOL,
-						   NULL));
+		ret = xdp_rxq_info_reg_mem_model(&rx_q->xdp_rxq,
+						 MEM_TYPE_XSK_BUFF_POOL, NULL);
+		if (ret)
+			return ret;
 		netdev_info(priv->dev,
 			    "Register MEM_TYPE_XSK_BUFF_POOL RxQ-%d\n",
 			    queue);
 		xsk_pool_set_rxq_info(rx_q->xsk_pool, &rx_q->xdp_rxq);
 	} else {
-		WARN_ON(xdp_rxq_info_reg_mem_model(&rx_q->xdp_rxq,
-						   MEM_TYPE_PAGE_POOL,
-						   rx_q->page_pool));
+		ret = xdp_rxq_info_reg_mem_model(&rx_q->xdp_rxq,
+						 MEM_TYPE_PAGE_POOL, rx_q->page_pool);
+		if (ret)
+			return ret;
 		netdev_info(priv->dev,
 			    "Register MEM_TYPE_PAGE_POOL RxQ-%d\n",
 			    queue);
@@ -2388,6 +2404,7 @@ static void __free_dma_tx_desc_resources(struct stmmac_priv *priv,
 
 	kfree(tx_q->tx_skbuff);
 	tx_q->tx_skbuff = NULL;
+	tx_q->xsk_pool = NULL;
 }
 
 static void free_dma_tx_desc_resources(struct stmmac_priv *priv,
@@ -2895,6 +2912,12 @@ static bool stmmac_xdp_xmit_zc(struct stmmac_priv *priv, u32 queue, u32 budget)
 	bool work_done = true;
 	u32 tx_set_ic_bit = 0;
 
+	/* Nothing can be submitted while the link is down. Let NAPI complete;
+	 * userspace can retry ndo_xsk_wakeup() once carrier has returned.
+	 */
+	if (!netif_carrier_ok(priv->dev))
+		return true;
+
 	/* Avoids TX time-out as we are sharing with slow path */
 	txq_trans_cond_update(nq);
 
@@ -2909,8 +2932,7 @@ static bool stmmac_xdp_xmit_zc(struct stmmac_priv *priv, u32 queue, u32 budget)
 		/* We are sharing with slow path and stop XSK TX desc submission when
 		 * available TX ring is less than threshold.
 		 */
-		if (unlikely(stmmac_tx_avail(priv, queue) < STMMAC_TX_XSK_AVAIL) ||
-		    !netif_carrier_ok(priv->dev)) {
+		if (unlikely(stmmac_tx_avail(priv, queue) < STMMAC_TX_XSK_AVAIL)) {
 			work_done = false;
 			break;
 		}
@@ -3139,6 +3161,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
 			}
 		}
 
+		/* Teardown walks the whole ring, including completed slots. */
+		tx_q->tx_skbuff_dma[entry].buf_type = STMMAC_TXBUF_T_SKB;
 		stmmac_release_tx_desc(priv, p, priv->descriptor_mode);
 
 		entry = STMMAC_NEXT_ENTRY(entry, priv->dma_conf->dma_tx_size);
@@ -7563,107 +7587,6 @@ static int stmmac_xdp_xmit(struct net_device *dev, int num_frames,
 	return nxmit;
 }
 
-void stmmac_disable_rx_queue(struct stmmac_priv *priv, u32 queue)
-{
-	struct stmmac_channel *ch = &priv->channel[queue];
-	unsigned long flags;
-
-	spin_lock_irqsave(&ch->lock, flags);
-	stmmac_disable_dma_irq(priv, priv->ioaddr, queue, 1, 0);
-	spin_unlock_irqrestore(&ch->lock, flags);
-
-	stmmac_stop_rx_dma(priv, queue);
-	__free_dma_rx_desc_resources(priv, priv->dma_conf, queue);
-}
-
-void stmmac_enable_rx_queue(struct stmmac_priv *priv, u32 queue)
-{
-	struct stmmac_rx_queue *rx_q = &priv->dma_conf->rx_queue[queue];
-	struct stmmac_channel *ch = &priv->channel[queue];
-	unsigned long flags;
-	int ret;
-
-	ret = __alloc_dma_rx_desc_resources(priv, priv->dma_conf, queue);
-	if (ret) {
-		netdev_err(priv->dev, "Failed to alloc RX desc.\n");
-		return;
-	}
-
-	ret = __init_dma_rx_desc_rings(priv, priv->dma_conf, queue, GFP_KERNEL);
-	if (ret) {
-		__free_dma_rx_desc_resources(priv, priv->dma_conf, queue);
-		netdev_err(priv->dev, "Failed to init RX desc.\n");
-		return;
-	}
-
-	stmmac_reset_rx_queue(priv, queue);
-	stmmac_clear_rx_descriptors(priv, priv->dma_conf, queue);
-
-	stmmac_init_rx_chan(priv, priv->ioaddr, priv->plat->dma_cfg,
-			    rx_q->dma_rx_phy, queue);
-
-	stmmac_set_queue_rx_tail_ptr(priv, rx_q, queue, rx_q->buf_alloc_num);
-
-	stmmac_set_queue_rx_buf_size(priv, rx_q, queue);
-
-	stmmac_start_rx_dma(priv, queue);
-
-	spin_lock_irqsave(&ch->lock, flags);
-	stmmac_enable_dma_irq(priv, priv->ioaddr, queue, 1, 0);
-	spin_unlock_irqrestore(&ch->lock, flags);
-}
-
-void stmmac_disable_tx_queue(struct stmmac_priv *priv, u32 queue)
-{
-	struct stmmac_channel *ch = &priv->channel[queue];
-	unsigned long flags;
-
-	spin_lock_irqsave(&ch->lock, flags);
-	stmmac_disable_dma_irq(priv, priv->ioaddr, queue, 0, 1);
-	spin_unlock_irqrestore(&ch->lock, flags);
-
-	stmmac_stop_tx_dma(priv, queue);
-	__free_dma_tx_desc_resources(priv, priv->dma_conf, queue);
-}
-
-void stmmac_enable_tx_queue(struct stmmac_priv *priv, u32 queue)
-{
-	struct stmmac_tx_queue *tx_q = &priv->dma_conf->tx_queue[queue];
-	struct stmmac_channel *ch = &priv->channel[queue];
-	unsigned long flags;
-	int ret;
-
-	ret = __alloc_dma_tx_desc_resources(priv, priv->dma_conf, queue);
-	if (ret) {
-		netdev_err(priv->dev, "Failed to alloc TX desc.\n");
-		return;
-	}
-
-	ret = __init_dma_tx_desc_rings(priv,  priv->dma_conf, queue);
-	if (ret) {
-		__free_dma_tx_desc_resources(priv, priv->dma_conf, queue);
-		netdev_err(priv->dev, "Failed to init TX desc.\n");
-		return;
-	}
-
-	stmmac_reset_tx_queue(priv, queue);
-	stmmac_clear_tx_descriptors(priv, priv->dma_conf, queue);
-
-	stmmac_init_tx_chan(priv, priv->ioaddr, priv->plat->dma_cfg,
-			    tx_q->dma_tx_phy, queue);
-
-	if (tx_q->tbs & STMMAC_TBS_AVAIL)
-		stmmac_enable_tbs(priv, priv->ioaddr, 1, queue);
-
-	stmmac_set_queue_tx_tail_ptr(priv, tx_q, queue, 0);
-
-	stmmac_start_tx_dma(priv, queue);
-
-	spin_lock_irqsave(&ch->lock, flags);
-	stmmac_enable_dma_irq(priv, priv->ioaddr, queue, 0, 1);
-	spin_unlock_irqrestore(&ch->lock, flags);
-}
-
 void stmmac_xdp_release(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
@@ -7763,6 +7686,9 @@ int stmmac_xdp_open(struct net_device *dev)
 
 		stmmac_set_queue_tx_tail_ptr(priv, tx_q, chan, 0);
 
+		if (tx_q->tbs & STMMAC_TBS_AVAIL)
+			stmmac_enable_tbs(priv, priv->ioaddr, 1, chan);
+
 		hrtimer_setup(&tx_q->txtimer, stmmac_tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	}
 
@@ -7782,6 +7708,7 @@ int stmmac_xdp_open(struct net_device *dev)
 	priv->datapath = STMMAC_DATAPATH_RUNNING;
 	phylink_replay_link_end(priv->phylink);
 	netif_device_attach(dev);
+	stmmac_schedule_xsk(priv);
 
 	return 0;
 
@@ -7800,11 +7727,9 @@ dma_desc_error:
 	return ret;
 }
 
-int stmmac_xsk_wakeup(struct net_device *dev, u32 queue, u32 flags)
+static int stmmac_xsk_wakeup(struct net_device *dev, u32 queue, u32 flags)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
-	struct stmmac_rx_queue *rx_q;
-	struct stmmac_tx_queue *tx_q;
 	struct stmmac_channel *ch;
 
 	if (test_bit(STMMAC_DOWN, &priv->state) ||
@@ -7818,11 +7743,9 @@ int stmmac_xsk_wakeup(struct net_device *dev, u32 queue, u32 flags)
 	    queue >= priv->plat->tx_queues_to_use)
 		return -EINVAL;
 
-	rx_q = &priv->dma_conf->rx_queue[queue];
-	tx_q = &priv->dma_conf->tx_queue[queue];
 	ch = &priv->channel[queue];
 
-	if (!rx_q->xsk_pool && !tx_q->xsk_pool)
+	if (!test_bit(queue, priv->af_xdp_zc_qps))
 		return -EINVAL;
 
 	if (!napi_if_scheduled_mark_missed(&ch->rxtx_napi)) {
@@ -9280,13 +9203,40 @@ err:
 __setup("stmmaceth=", stmmac_cmdline_opt);
 #endif /* MODULE */
 
+static int stmmac_xsk_device_event(struct notifier_block *unused,
+				   unsigned long event, void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+
+	/* mac_link_up() runs before phylink publishes carrier. Linkwatch is
+	 * the post-publication kick for TX-only pools sleeping through a flap.
+	 */
+	if (event == NETDEV_CHANGE && dev->netdev_ops == &stmmac_netdev_ops)
+		stmmac_schedule_xsk(netdev_priv(dev));
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block stmmac_xsk_notifier = {
+	.notifier_call = stmmac_xsk_device_event,
+};
+
 static int __init stmmac_init(void)
 {
+	int ret;
+
+	ret = register_netdevice_notifier(&stmmac_xsk_notifier);
+	if (ret)
+		return ret;
 #ifdef CONFIG_DEBUG_FS
 	/* Create debugfs main directory if it doesn't exist yet */
 	if (!stmmac_fs_dir)
 		stmmac_fs_dir = debugfs_create_dir(STMMAC_RESOURCE_NAME, NULL);
-	register_netdevice_notifier(&stmmac_notifier);
+	ret = register_netdevice_notifier(&stmmac_notifier);
+	if (ret) {
+		debugfs_remove_recursive(stmmac_fs_dir);
+		unregister_netdevice_notifier(&stmmac_xsk_notifier);
+		return ret;
+	}
 #endif
 
 	return 0;
@@ -9294,6 +9244,7 @@ static int __init stmmac_init(void)
 
 static void __exit stmmac_exit(void)
 {
+	unregister_netdevice_notifier(&stmmac_xsk_notifier);
 #ifdef CONFIG_DEBUG_FS
 	unregister_netdevice_notifier(&stmmac_notifier);
 	debugfs_remove_recursive(stmmac_fs_dir);
