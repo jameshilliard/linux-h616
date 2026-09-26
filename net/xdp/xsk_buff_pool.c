@@ -17,6 +17,11 @@
  */
 static LIST_HEAD(xsk_dev_pools);
 
+struct xsk_dma_ref {
+	struct xsk_dma_map *dma_map;
+	struct xsk_buff_pool *pool;
+};
+
 void xp_add_xsk(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 {
 	if (!xs->tx)
@@ -39,7 +44,7 @@ void xp_del_xsk(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 
 void xp_destroy(struct xsk_buff_pool *pool)
 {
-	if (!pool)
+	if (!pool || !refcount_dec_and_test(&pool->refs))
 		return;
 
 	kvfree(pool->tx_descs);
@@ -73,6 +78,7 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	pool = kvzalloc_flex(*pool, free_heads, entries);
 	if (!pool)
 		goto out;
+	refcount_set(&pool->refs, 1);
 
 	pool->heads = kvzalloc_objs(*pool->heads, umem->chunks);
 	if (!pool->heads)
@@ -380,7 +386,8 @@ static struct xsk_dma_map *xp_find_dma_map(struct xsk_buff_pool *pool)
 }
 
 static struct xsk_dma_map *xp_create_dma_map(struct device *dev, struct net_device *netdev,
-					     u32 nr_pages, struct xdp_umem *umem)
+					     u32 nr_pages, struct xdp_umem *umem,
+					     unsigned long attrs)
 {
 	struct xsk_dma_map *dma_map;
 
@@ -396,6 +403,8 @@ static struct xsk_dma_map *xp_create_dma_map(struct device *dev, struct net_devi
 
 	dma_map->netdev = netdev;
 	dma_map->dev = dev;
+	dma_map->umem = umem;
+	dma_map->attrs = attrs;
 	dma_map->dma_pages_cnt = nr_pages;
 	refcount_set(&dma_map->users, 1);
 	list_add(&dma_map->list, &umem->xsk_dma_list);
@@ -449,6 +458,69 @@ void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
 	pool->dev = NULL;
 }
 EXPORT_SYMBOL(xp_dma_unmap);
+
+struct xsk_dma_ref *xp_dma_get(struct xsk_buff_pool *pool)
+{
+	struct xsk_dma_map *dma_map;
+	struct xsk_dma_ref *ref;
+
+	ASSERT_RTNL();
+	if (!pool->dma_pages)
+		return NULL;
+	dma_map = xp_find_dma_map(pool);
+	if (WARN_ON_ONCE(!dma_map))
+		return NULL;
+
+	ref = kmalloc_obj(*ref);
+	if (!ref)
+		return NULL;
+	ref->dma_map = dma_map;
+	ref->pool = pool;
+	refcount_inc(&pool->refs);
+	refcount_inc(&dma_map->users);
+	xdp_get_umem(dma_map->umem);
+	get_device(dma_map->dev);
+	/* Keep the mapping's lookup key alive without preventing unregister. */
+	get_device(&dma_map->netdev->dev);
+	return ref;
+}
+EXPORT_SYMBOL_GPL(xp_dma_get);
+
+void xp_dma_complete(struct xsk_dma_ref *ref, u32 count)
+{
+	ASSERT_RTNL();
+	/* xp_release_deferred() clears netdev under RTNL before freeing the CQ.
+	 * A detached pool cannot submit any later TX reservations either.
+	 */
+	if (ref->pool->netdev)
+		xsk_tx_completed(ref->pool, count);
+}
+EXPORT_SYMBOL_GPL(xp_dma_complete);
+
+void xp_dma_put(struct xsk_dma_ref *ref)
+{
+	struct xsk_dma_map *dma_map;
+	struct net_device *netdev;
+	struct xdp_umem *umem;
+	struct device *dev;
+
+	ASSERT_RTNL();
+	if (!ref)
+		return;
+	dma_map = ref->dma_map;
+	dev = dma_map->dev;
+	netdev = dma_map->netdev;
+	umem = dma_map->umem;
+	if (refcount_dec_and_test(&dma_map->users))
+		__xp_dma_unmap(dma_map, dma_map->attrs);
+	/* Unmap before the final reference can unpin the UMEM pages. */
+	xdp_put_umem(umem, false);
+	put_device(&netdev->dev);
+	put_device(dev);
+	xp_destroy(ref->pool);
+	kfree(ref);
+}
+EXPORT_SYMBOL_GPL(xp_dma_put);
 
 static void xp_check_dma_contiguity(struct xsk_dma_map *dma_map)
 {
@@ -507,7 +579,7 @@ int xp_dma_map(struct xsk_buff_pool *pool, struct device *dev,
 		return 0;
 	}
 
-	dma_map = xp_create_dma_map(dev, pool->netdev, nr_pages, pool->umem);
+	dma_map = xp_create_dma_map(dev, pool->netdev, nr_pages, pool->umem, attrs);
 	if (!dma_map)
 		return -ENOMEM;
 
