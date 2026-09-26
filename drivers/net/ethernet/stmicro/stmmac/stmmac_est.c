@@ -84,12 +84,24 @@ int __stmmac_setup_est(struct stmmac_priv *priv)
 {
 	struct timespec64 current_time, time;
 	ktime_t current_time_ns, basetime;
+	unsigned long flags;
+	u64 now;
 	u64 cycle_time;
 	int err;
 
 	lockdep_assert_held(&priv->est_lock);
+	lockdep_assert_held(&priv->ptp_mutex);
 
-	priv->ptp_clock_ops.gettime64(&priv->ptp_clock_ops, &current_time);
+	if (!priv->ptp_enabled)
+		return -EOPNOTSUPP;
+
+	/* Reset replay owns ptp_mutex while public PHC reads are blocked. */
+	read_lock_irqsave(&priv->ptp_lock, flags);
+	err = stmmac_get_systime(priv, priv->ptpaddr, &now);
+	read_unlock_irqrestore(&priv->ptp_lock, flags);
+	if (err)
+		return err;
+	current_time = ns_to_timespec64(now);
 	current_time_ns = timespec64_to_ktime(current_time);
 
 	time.tv_nsec = priv->est.btr_reserve[0];
