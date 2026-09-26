@@ -12,6 +12,17 @@
 #include "stmmac.h"
 #include "stmmac_est.h"
 
+static int tc_config_preemption(struct stmmac_priv *priv,
+				struct netlink_ext_ack *extack, u32 preemptible_tcs)
+{
+	/* Qdisc teardown must not access unpowered registers. */
+	if (priv->hw_unavailable)
+		return 0;
+
+	return stmmac_fpe_map_preemption_class(priv, priv->dev, extack,
+					      preemptible_tcs);
+}
+
 static void tc_fill_all_pass_entry(struct stmmac_tc_entry *entry)
 {
 	memset(entry, 0, sizeof(*entry));
@@ -172,18 +183,16 @@ err_unuse:
 static void tc_unfill_entry(struct stmmac_priv *priv,
 			    struct tc_cls_u32_offload *cls)
 {
-	struct stmmac_tc_entry *entry;
+	struct stmmac_tc_entry *entry, *frag;
 
 	entry = tc_find_entry(priv, cls, false);
 	if (!entry)
 		return;
 
-	entry->in_use = false;
-	if (entry->frag_ptr) {
-		entry = entry->frag_ptr;
-		entry->is_frag = false;
-		entry->in_use = false;
-	}
+	frag = entry->frag_ptr;
+	if (frag)
+		memset(frag, 0, sizeof(*frag));
+	memset(entry, 0, sizeof(*entry));
 }
 
 static int tc_config_knode(struct stmmac_priv *priv,
@@ -212,6 +221,9 @@ static int tc_delete_knode(struct stmmac_priv *priv,
 {
 	/* Set entry and fragments as not used */
 	tc_unfill_entry(priv, cls);
+
+	if (!stmmac_tc_active(priv))
+		return 0;
 
 	return stmmac_rxp_config(priv, priv->hw->pcsr, priv->tc_entries,
 				 priv->tc_entries_max);
@@ -346,6 +358,8 @@ static int tc_setup_cbs(struct stmmac_priv *priv,
 		return -EINVAL;
 	if (!priv->dma_cap.av)
 		return -EOPNOTSUPP;
+	if (priv->hw_unavailable && qopt->enable)
+		return -EHOSTDOWN;
 
 	port_transmit_rate_kbps = qopt->idleslope - qopt->sendslope;
 
@@ -381,10 +395,12 @@ static int tc_setup_cbs(struct stmmac_priv *priv,
 
 		priv->plat->tx_queues_cfg[queue].mode_to_use = MTL_QUEUE_AVB;
 	} else if (!qopt->enable) {
-		ret = stmmac_dma_qmode(priv, priv->ioaddr, queue,
-				       MTL_QUEUE_DCB);
-		if (ret)
-			return ret;
+		if (!priv->hw_unavailable) {
+			ret = stmmac_dma_qmode(priv, priv->ioaddr, queue,
+					       MTL_QUEUE_DCB);
+			if (ret)
+				return ret;
+		}
 
 		priv->plat->tx_queues_cfg[queue].mode_to_use = MTL_QUEUE_DCB;
 		return 0;
@@ -646,23 +662,21 @@ static int tc_del_flow(struct stmmac_priv *priv,
 		       struct flow_cls_offload *cls)
 {
 	struct stmmac_flow_entry *entry = tc_find_flow(priv, cls, false);
-	int ret;
+	int ret = 0;
 
 	if (!entry || !entry->in_use)
 		return -ENOENT;
 
-	if (entry->is_l4) {
-		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, false,
-					      false, false, false, 0);
-	} else {
-		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, false,
-					      false, false, false, 0);
+	if (stmmac_tc_active(priv)) {
+		if (entry->is_l4)
+			ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx,
+						      false, false, false, false, 0);
+		else
+			ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx,
+						      false, false, false, false, 0);
 	}
 
-	entry->in_use = false;
-	entry->cookie = 0;
-	entry->is_l4 = false;
-	entry->action = 0;
+	*entry = (struct stmmac_flow_entry) { .idx = entry->idx };
 	return ret;
 }
 
@@ -745,7 +759,8 @@ static int tc_del_vlan_flow(struct stmmac_priv *priv,
 	if (!entry || !entry->in_use || entry->type != STMMAC_RFS_T_VLAN)
 		return -ENOENT;
 
-	stmmac_rx_queue_prio(priv, priv->hw, 0, entry->tc);
+	if (stmmac_tc_active(priv))
+		stmmac_rx_queue_prio(priv, priv->hw, 0, entry->tc);
 
 	entry->in_use = false;
 	entry->cookie = 0;
@@ -841,13 +856,13 @@ static int tc_del_ethtype_flow(struct stmmac_priv *priv,
 
 	switch (entry->etype) {
 	case ETH_P_LLDP:
-		stmmac_rx_queue_routing(priv, priv->hw,
-					PACKET_DCBCPQ, 0);
+		if (stmmac_tc_active(priv))
+			stmmac_rx_queue_routing(priv, priv->hw, PACKET_DCBCPQ, 0);
 		priv->rfs_entries_cnt[STMMAC_RFS_T_LLDP]--;
 		break;
 	case ETH_P_1588:
-		stmmac_rx_queue_routing(priv, priv->hw,
-					PACKET_PTPQ, 0);
+		if (stmmac_tc_active(priv))
+			stmmac_rx_queue_routing(priv, priv->hw, PACKET_PTPQ, 0);
 		priv->rfs_entries_cnt[STMMAC_RFS_T_1588]--;
 		break;
 	default:
@@ -902,12 +917,12 @@ static int tc_setup_cls(struct stmmac_priv *priv,
 {
 	int ret = 0;
 
-	/* When RSS is enabled, the filtering will be bypassed */
-	if (priv->rss.enable)
-		return -EBUSY;
-
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
+		/* When RSS is enabled, the filtering will be bypassed. */
+		if (priv->rss.enable)
+			return -EBUSY;
+
 		ret = tc_add_flow_cls(priv, cls);
 		break;
 	case FLOW_CLS_DESTROY:
@@ -1019,6 +1034,8 @@ static int tc_taprio_configure(struct stmmac_priv *priv,
 
 	if (qopt->cmd == TAPRIO_CMD_DESTROY)
 		goto disable;
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
 	if (!priv->ptp_enabled || !priv->ptp_clock_ops.gettime64)
 		return -EOPNOTSUPP;
 	/* Unlike reset replay, a new schedule requires an accessible PHC. */
@@ -1085,8 +1102,7 @@ static int tc_taprio_configure(struct stmmac_priv *priv,
 	if (ret)
 		goto restore;
 
-	ret = stmmac_fpe_map_preemption_class(priv, priv->dev, extack,
-					     qopt->mqprio.preemptible_tcs);
+	ret = tc_config_preemption(priv, extack, qopt->mqprio.preemptible_tcs);
 	if (ret)
 		goto restore;
 
@@ -1111,8 +1127,9 @@ restore:
 disable:
 	mutex_lock(&priv->est_lock);
 	priv->est.enable = false;
-	stmmac_est_configure(priv, priv, &priv->est,
-			     priv->plat->clk_ptp_rate, false);
+	if (!priv->hw_unavailable)
+		stmmac_est_configure(priv, priv, &priv->est,
+				     priv->plat->clk_ptp_rate, false);
 	/* Reset taprio stats */
 	for (i = 0; i < priv->plat->tx_queues_to_use; i++) {
 		priv->xstats.max_sdu_txq_drop[i] = 0;
@@ -1121,7 +1138,7 @@ disable:
 	}
 	mutex_unlock(&priv->est_lock);
 
-	return stmmac_fpe_map_preemption_class(priv, priv->dev, extack, 0);
+	return tc_config_preemption(priv, extack, 0);
 }
 
 static void tc_taprio_stats(struct stmmac_priv *priv,
@@ -1271,7 +1288,7 @@ static int stmmac_reset_tc_mqprio(struct net_device *ndev,
 	netdev_reset_tc(ndev);
 	netif_set_real_num_tx_queues(ndev, priv->plat->tx_queues_to_use);
 
-	return stmmac_fpe_map_preemption_class(priv, ndev, extack, 0);
+	return tc_config_preemption(priv, extack, 0);
 }
 
 static int tc_setup_dwmac510_mqprio(struct stmmac_priv *priv,
@@ -1288,6 +1305,8 @@ static int tc_setup_dwmac510_mqprio(struct stmmac_priv *priv,
 
 	if (!qopt->num_tc)
 		return stmmac_reset_tc_mqprio(ndev, extack);
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
 
 	if (qopt->num_tc > ARRAY_SIZE(tc_to_txq))
 		return -EINVAL;
@@ -1317,8 +1336,7 @@ static int tc_setup_dwmac510_mqprio(struct stmmac_priv *priv,
 	if (err)
 		goto error_reset_tc;
 
-	err = stmmac_fpe_map_preemption_class(priv, ndev, extack,
-					      mqprio->preemptible_tcs);
+	err = tc_config_preemption(priv, extack, mqprio->preemptible_tcs);
 	if (err)
 		goto error_reset_num_tx_queues;
 

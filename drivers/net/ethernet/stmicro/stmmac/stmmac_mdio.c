@@ -135,6 +135,9 @@ static int stmmac_xgmac2_mdio_read_c22(struct mii_bus *bus, int phyaddr,
 	struct stmmac_priv *priv = netdev_priv(bus->priv);
 	u32 addr;
 
+	if (READ_ONCE(priv->hw_unavailable))
+		return -EHOSTDOWN;
+
 	/* Until ver 2.20 XGMAC does not support C22 addr >= 4 */
 	if (priv->synopsys_id < DWXGMAC_CORE_2_20 &&
 	    phyaddr > MII_XGMAC_MAX_C22ADDR)
@@ -150,6 +153,9 @@ static int stmmac_xgmac2_mdio_read_c45(struct mii_bus *bus, int phyaddr,
 {
 	struct stmmac_priv *priv = netdev_priv(bus->priv);
 	u32 addr;
+
+	if (READ_ONCE(priv->hw_unavailable))
+		return -EHOSTDOWN;
 
 	stmmac_xgmac2_c45_format(priv, phyaddr, devad, phyreg, &addr);
 
@@ -198,6 +204,9 @@ static int stmmac_xgmac2_mdio_write_c22(struct mii_bus *bus, int phyaddr,
 	struct stmmac_priv *priv = netdev_priv(bus->priv);
 	u32 addr;
 
+	if (READ_ONCE(priv->hw_unavailable))
+		return -EHOSTDOWN;
+
 	/* Until ver 2.20 XGMAC does not support C22 addr >= 4 */
 	if (priv->synopsys_id < DWXGMAC_CORE_2_20 &&
 	    phyaddr > MII_XGMAC_MAX_C22ADDR)
@@ -214,6 +223,9 @@ static int stmmac_xgmac2_mdio_write_c45(struct mii_bus *bus, int phyaddr,
 {
 	struct stmmac_priv *priv = netdev_priv(bus->priv);
 	u32 addr;
+
+	if (READ_ONCE(priv->hw_unavailable))
+		return -EHOSTDOWN;
 
 	stmmac_xgmac2_c45_format(priv, phyaddr, devad, phyreg, &addr);
 
@@ -247,6 +259,9 @@ static int stmmac_mdio_access(struct stmmac_priv *priv, unsigned int pa,
 	void __iomem *mii_data = priv->ioaddr + priv->hw->mii.data;
 	u32 addr;
 	int ret;
+
+	if (READ_ONCE(priv->hw_unavailable))
+		return -EHOSTDOWN;
 
 	ret = pm_runtime_resume_and_get(priv->device);
 	if (ret < 0)
@@ -591,7 +606,11 @@ int stmmac_mdio_register(struct net_device *ndev)
 	if (!mdio_bus_data)
 		return 0;
 
-	if (mdio_bus_data->needs_reset && dev_of_node(priv->device)) {
+	/* Cache reset resources for the lifetime of an enabled platform MDIO
+	 * bus, independently of whether registration invokes its reset callback.
+	 */
+	if (IS_ENABLED(CONFIG_STMMAC_PLATFORM) && dev_of_node(priv->device) &&
+	    (!mdio_node || of_device_is_available(mdio_node))) {
 		priv->mdio_reset_gpio =
 			devm_gpiod_get_optional(priv->device, "snps,reset",
 						GPIOD_OUT_LOW);

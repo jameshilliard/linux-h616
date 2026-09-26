@@ -39,6 +39,7 @@
 #endif /* CONFIG_DEBUG_FS */
 #include <linux/net_tstamp.h>
 #include <linux/phylink.h>
+#include <linux/pci.h>
 #include <linux/udp.h>
 #include <linux/bpf_trace.h>
 #include <net/devlink.h>
@@ -662,6 +663,9 @@ static int __stmmac_hwtstamp_set(struct net_device *dev,
 	u32 ts_event_en = 0;
 	unsigned long flags;
 
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
+
 	if (!priv->plat->clk_ptp_rate ||
 	    !(priv->dma_cap.time_stamp || priv->adv_ts)) {
 		NL_SET_ERR_MSG_MOD(extack, "No support for HW time stamping");
@@ -984,7 +988,10 @@ static int __stmmac_setup_ptp(struct stmmac_priv *priv)
 	priv->ptp_extts = 0;
 	priv->plat->flags &= ~STMMAC_FLAG_EXT_SNAPSHOT_EN;
 
+	mutex_lock(&priv->pm_mutex);
 	ret = clk_prepare_enable(priv->plat->clk_ptp_ref);
+	priv->ptp_clock_enabled = !ret;
+	mutex_unlock(&priv->pm_mutex);
 	if (ret < 0) {
 		netdev_warn(priv->dev,
 			    "failed to enable PTP reference clock: %pe\n",
@@ -993,20 +1000,25 @@ static int __stmmac_setup_ptp(struct stmmac_priv *priv)
 	}
 
 	if (stmmac_init_ptp_clk_freq(priv)) {
-		clk_disable_unprepare(priv->plat->clk_ptp_ref);
-		return 0;
+		ret = 0;
+		goto disable_clock;
 	}
 
 	ret = stmmac_init_timestamping(priv);
-	if (ret) {
-		clk_disable_unprepare(priv->plat->clk_ptp_ref);
-		return ret;
-	}
+	if (ret)
+		goto disable_clock;
 
 	stmmac_ptp_register(priv);
 	priv->ptp_enabled = true;
 
 	return 0;
+
+disable_clock:
+	mutex_lock(&priv->pm_mutex);
+	clk_disable_unprepare(priv->plat->clk_ptp_ref);
+	priv->ptp_clock_enabled = false;
+	mutex_unlock(&priv->pm_mutex);
+	return ret;
 }
 
 /* ptp_mutex excludes configuration and crosstimestamp operations. The
@@ -1037,7 +1049,14 @@ static void stmmac_release_ptp(struct stmmac_priv *priv)
 	mutex_lock(&priv->ptp_mutex);
 	stmmac_block_ptp(priv, true);
 	priv->ptp_enabled = false;
-	clk_disable_unprepare(priv->plat->clk_ptp_ref);
+	mutex_lock(&priv->pm_mutex);
+	if (priv->ptp_clock_enabled) {
+		clk_disable_unprepare(priv->plat->clk_ptp_ref);
+		priv->ptp_clock_enabled = false;
+	}
+	/* A later noirq resume must not reacquire a released reference. */
+	priv->ptp_clock_suspended = false;
+	mutex_unlock(&priv->pm_mutex);
 	mutex_unlock(&priv->ptp_mutex);
 }
 
@@ -1175,6 +1194,9 @@ static void stmmac_mac_link_down(struct phylink_config *config,
 {
 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
 
+	if (READ_ONCE(priv->hw_unavailable))
+		return;
+
 	stmmac_mac_set(priv, priv->ioaddr, false);
 	if (priv->dma_cap.eee)
 		stmmac_set_eee_pls(priv, priv->hw, false);
@@ -1299,10 +1321,12 @@ static void stmmac_mac_disable_tx_lpi(struct phylink_config *config)
 	netdev_dbg(priv->dev, "disable EEE\n");
 	priv->eee_sw_timer_en = false;
 	timer_delete_sync(&priv->eee_ctrl_timer);
-	stmmac_set_lpi_mode(priv, priv->hw, STMMAC_LPI_DISABLE, false, 0);
 	priv->tx_path_in_lpi_mode = false;
 
-	stmmac_set_eee_timer(priv, priv->hw, 0, STMMAC_DEFAULT_TWT_LS);
+	if (!READ_ONCE(priv->hw_unavailable)) {
+		stmmac_set_lpi_mode(priv, priv->hw, STMMAC_LPI_DISABLE, false, 0);
+		stmmac_set_eee_timer(priv, priv->hw, 0, STMMAC_DEFAULT_TWT_LS);
+	}
 	mutex_unlock(&priv->lock);
 }
 
@@ -3926,10 +3950,6 @@ static int stmmac_hw_setup(struct net_device *dev)
 		stmmac_enable_tbs(priv, priv->ioaddr, enable, chan);
 	}
 
-	/* Configure real RX and TX queues */
-	netif_set_real_num_rx_queues(dev, priv->plat->rx_queues_to_use);
-	netif_set_real_num_tx_queues(dev, priv->plat->tx_queues_to_use);
-
 
 	phylink_rx_clk_stop_block(priv->phylink);
 	stmmac_set_hw_vlan_mode(priv, priv->hw);
@@ -4215,6 +4235,16 @@ irq_error:
 	return ret;
 }
 
+static void stmmac_unmask_pci_irq(struct stmmac_priv *priv)
+{
+#ifdef CONFIG_PCI
+	if (priv->pci_intx_masked) {
+		priv->pci_intx_masked = false;
+		pci_intx(to_pci_dev(priv->device), true);
+	}
+#endif
+}
+
 static int stmmac_request_irq(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
@@ -4226,7 +4256,36 @@ static int stmmac_request_irq(struct net_device *dev)
 	else
 		ret = stmmac_request_irq_single(dev);
 
+	if (!ret)
+		stmmac_unmask_pci_irq(priv);
+
 	return ret;
+}
+
+/* Drain registered handlers without disabling lines shared by other devices. */
+static void stmmac_synchronize_irq(struct stmmac_priv *priv)
+{
+	struct stmmac_msi *msi = priv->msi;
+	int irq = priv->dev->irq;
+	u32 i;
+
+	synchronize_irq(irq);
+	if (priv->wol_irq > 0 && priv->wol_irq != irq)
+		synchronize_irq(priv->wol_irq);
+	if (priv->sfty_irq > 0 && priv->sfty_irq != irq)
+		synchronize_irq(priv->sfty_irq);
+	if (!msi)
+		return;
+	if (msi->sfty_ce_irq > 0 && msi->sfty_ce_irq != irq)
+		synchronize_irq(msi->sfty_ce_irq);
+	if (msi->sfty_ue_irq > 0 && msi->sfty_ue_irq != irq)
+		synchronize_irq(msi->sfty_ue_irq);
+	for (i = 0; i < priv->plat->rx_queues_to_use; i++)
+		if (msi->rx_irq[i] > 0)
+			synchronize_irq(msi->rx_irq[i]);
+	for (i = 0; i < priv->plat->tx_queues_to_use; i++)
+		if (msi->tx_irq[i] > 0)
+			synchronize_irq(msi->tx_irq[i]);
 }
 
 /**
@@ -4307,6 +4366,109 @@ alloc_error:
 	return ERR_PTR(ret);
 }
 
+/* The freezer excludes pool teardown and userspace from noirq callbacks.
+ * Outside system sleep these flags are changed under RTNL.
+ */
+int stmmac_resume_clocks(struct stmmac_priv *priv)
+{
+	int ret = 0;
+
+	mutex_lock(&priv->pm_mutex);
+	if (priv->bus_clks_suspended) {
+		if (priv->force_resume_pending) {
+			/* The force helper consumes the PM disable even on error. */
+			priv->force_resume_pending = false;
+			ret = pm_runtime_force_resume(priv->device);
+		} else {
+			ret = pm_runtime_resume(priv->device);
+			/* A failed runtime callback latches runtime_error. The bus
+			 * clock callback unwinds its enables, so allow another retry.
+			 */
+			if (ret < 0)
+				pm_runtime_set_suspended(priv->device);
+		}
+		if (ret < 0)
+			goto out;
+		ret = 0;
+		priv->bus_clks_suspended = false;
+	}
+	if (priv->ptp_clock_suspended) {
+		ret = clk_prepare_enable(priv->plat->clk_ptp_ref);
+		if (ret)
+			goto out;
+		priv->ptp_clock_enabled = true;
+		priv->ptp_clock_suspended = false;
+	}
+out:
+	mutex_unlock(&priv->pm_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(stmmac_resume_clocks);
+
+static int stmmac_resume_power(struct stmmac_priv *priv, bool system_resume)
+{
+	int ret;
+
+	priv->power_resume_pending |= system_resume || priv->bus_clks_suspended ||
+				      priv->bsp_suspended || priv->ptp_clock_suspended;
+	ret = stmmac_resume_clocks(priv);
+	if (ret)
+		return ret;
+	if (priv->wol_suspended) {
+		priv->plat->resume_wol(priv->device, priv->plat->bsp_priv);
+		priv->wol_suspended = false;
+	}
+	if (priv->bsp_suspended && priv->plat->resume) {
+		ret = priv->plat->resume(priv->device, priv->plat->bsp_priv);
+		if (ret)
+			return ret;
+		priv->bsp_suspended = false;
+	}
+	/* A wrapper which powers the device outside these callbacks must
+	 * complete its own resume before core register access is possible.
+	 */
+	if (priv->power_resume_pending) {
+		WRITE_ONCE(priv->hw_unavailable, false);
+		priv->power_resume_pending = false;
+	}
+	return priv->hw_unavailable ? -EHOSTDOWN : 0;
+}
+
+/* Finish core sleep state only after its power dependencies are restored. */
+static int stmmac_resume_hw(struct stmmac_priv *priv)
+{
+	int ret;
+
+	if (!priv->hw_suspended)
+		return 0;
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
+
+	/* Use the state installed by suspend, not a subsequently changed WoL
+	 * setting. Clear PMT even when a different device caused the wakeup.
+	 */
+	if (priv->irq_wake) {
+		mutex_lock(&priv->lock);
+		stmmac_pmt(priv, priv->hw, 0);
+		mutex_unlock(&priv->lock);
+		WRITE_ONCE(priv->irq_wake, 0);
+		/* Finish any timestamp handler admitted by the retained wake
+		 * clocks before resume resets the PHC or close unregisters it.
+		 */
+		stmmac_synchronize_irq(priv);
+	} else {
+		ret = pinctrl_pm_select_default_state(priv->device);
+		if (ret)
+			return ret;
+		/* phylink owns PHY resume. A bus-wide hard reset here would lose
+		 * PHY configuration and WoL state without replaying config_init.
+		 */
+	}
+	priv->hw_suspended = false;
+
+	return 0;
+}
+
 /**
  *  __stmmac_open - open entry point of the driver
  *  @dev : pointer to the device structure.
@@ -4341,12 +4503,12 @@ static int __stmmac_open(struct net_device *dev,
 	ret = stmmac_hw_setup(dev);
 	if (ret < 0) {
 		netdev_err(priv->dev, "%s: Hw setup failed\n", __func__);
-		return ret;
+		goto init_error;
 	}
 
 	ret = stmmac_setup_ptp(priv);
 	if (ret)
-		goto ptp_error;
+		goto init_error;
 
 	/* The core soft reset in stmmac_hw_setup() clears the MTL_EST
 	 * registers, so re-apply the taprio offload after PTP is up.
@@ -4359,8 +4521,6 @@ static int __stmmac_open(struct net_device *dev,
 
 	stmmac_init_coalesce(priv);
 
-	phylink_start(priv->phylink);
-
 	stmmac_vlan_restore(priv);
 
 	/* Restore the installed schedule before starting DMA. */
@@ -4370,26 +4530,37 @@ static int __stmmac_open(struct net_device *dev,
 	if (ret)
 		goto irq_error;
 
+	/* Publish the topology only when no other fallible setup remains.
+	 * The combined setter restores the old counts if an increase fails.
+	 */
+	ret = netif_set_real_num_queues(dev, priv->plat->tx_queues_to_use,
+					priv->plat->rx_queues_to_use);
+	if (ret) {
+		stmmac_free_irq(dev, REQ_IRQ_ERR_ALL, 0);
+		goto irq_error;
+	}
+
 	stmmac_enable_all_queues(priv);
 	netif_tx_start_all_queues(priv->dev);
 	stmmac_enable_all_dma_irq(priv);
+	priv->datapath = STMMAC_DATAPATH_RUNNING;
+	phylink_start(priv->phylink);
 
 	return 0;
 
 irq_error:
-	phylink_stop(priv->phylink);
-
-	stmmac_stop_all_dma(priv);
-
 	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
 		hrtimer_cancel(&priv->dma_conf->tx_queue[chan].txtimer);
 
 est_error:
 	stmmac_release_ptp(priv);
-ptp_error:
+init_error:
+	/* Undo phylink_prepare_resume() even if hardware setup failed before
+	 * phylink_start(). Keep the PHY attachment and outer PM ownership.
+	 */
+	phylink_stop(priv->phylink);
 	stmmac_stop_all_dma(priv);
 	stmmac_mac_set(priv, priv->ioaddr, false);
-
 	return ret;
 }
 
@@ -4409,8 +4580,21 @@ static int stmmac_open(struct net_device *dev)
 		return PTR_ERR(dma_conf);
 
 	ret = pm_runtime_resume_and_get(priv->device);
-	if (ret < 0)
+	if (ret < 0) {
+		/* An open-time retry can reach the runtime callback before
+		 * stmmac_resume_clocks(). Keep a failed clock retry recoverable.
+		 */
+		if (priv->bus_clks_suspended)
+			pm_runtime_set_suspended(priv->device);
 		goto err_dma_resources;
+	}
+
+	ret = stmmac_resume_power(priv, false);
+	if (ret)
+		goto err_runtime_pm;
+	ret = stmmac_resume_hw(priv);
+	if (ret)
+		goto err_runtime_pm;
 
 	ret = stmmac_init_phy(dev);
 	if (ret)
@@ -4475,23 +4659,36 @@ static void __stmmac_release(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	/* A failed MTU reopen has already released the data path. */
+	if (priv->datapath == STMMAC_DATAPATH_DOWN)
+		return;
+
 	phylink_stop(priv->phylink);
-	stmmac_quiesce(priv);
+
+	/* Suspend retains the resources, but has already stopped activity. */
+	if (priv->datapath == STMMAC_DATAPATH_RUNNING)
+		stmmac_quiesce(priv);
+	priv->datapath = STMMAC_DATAPATH_DOWN;
 
 	/* Free the IRQ lines */
 	stmmac_free_irq(dev, REQ_IRQ_ERR_ALL, 0);
+
 	/* TX error IRQs can restart a queue after the first quiescence. */
 	stmmac_stop_tx_queues(priv);
 
-	/* Stop TX/RX DMA and clear the descriptors */
-	stmmac_stop_all_dma(priv);
+	/* Stop TX/RX DMA after draining IRQ handlers which can restart it. */
+	if (!priv->hw_unavailable) {
+		stmmac_stop_all_dma(priv);
+		/* Link resolution need not have reached mac_link_up() yet. */
+		stmmac_mac_set(priv, priv->ioaddr, false);
+	}
 
 	/* Release and free the Rx/Tx resources */
 	free_dma_desc_resources(priv, priv->dma_conf);
 
 	stmmac_release_ptp(priv);
 
-	if (stmmac_fpe_supported(priv))
+	if (!priv->hw_unavailable && stmmac_fpe_supported(priv))
 		ethtool_mmsv_stop(&priv->fpe_cfg.mmsv);
 }
 
@@ -4504,6 +4701,17 @@ static void __stmmac_release(struct net_device *dev)
 static int stmmac_release(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
+	int ret;
+
+	/* Resume may have failed before restoring pins or disabling MAC wake.
+	 * Complete that cleanup without restarting the link or the datapath.
+	 * If it fails, keep hw_suspended set so a fresh open can retry it.
+	 */
+	ret = stmmac_resume_power(priv, false);
+	if (!ret)
+		ret = stmmac_resume_hw(priv);
+	if (ret)
+		netdev_err(dev, "failed to restore hardware sleep state: %d\n", ret);
 
 	/* If the PHY or MAC has WoL enabled, then the PHY will not be
 	 * suspended when phylink_stop() is called below. Set the PHY
@@ -4517,6 +4725,8 @@ static int stmmac_release(struct net_device *dev)
 	stmmac_legacy_serdes_power_down(priv);
 	phylink_disconnect_phy(priv->phylink);
 	pm_runtime_put(priv->device);
+	/* Allow a fresh open after a failed MTU reopen or resume. */
+	netif_device_attach(dev);
 
 	return 0;
 }
@@ -6369,6 +6579,9 @@ static void stmmac_set_rx_mode(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	if (READ_ONCE(priv->hw_unavailable))
+		return;
+
 	stmmac_set_filter(priv, priv->hw, dev);
 }
 
@@ -6423,6 +6636,7 @@ static int stmmac_change_mtu(struct net_device *dev, int new_mtu)
 			return PTR_ERR(dma_conf);
 		}
 
+		netif_device_detach(dev);
 		__stmmac_release(dev);
 
 		ret = __stmmac_open(dev, dma_conf);
@@ -6430,6 +6644,11 @@ static int stmmac_change_mtu(struct net_device *dev, int new_mtu)
 			priv->dma_conf = old_conf;
 			free_dma_desc_resources(priv, dma_conf);
 			kfree(dma_conf);
+			/*
+			 * Keep the administrative state and PHY/PM ownership until
+			 * ndo_stop(), but prevent use of the released data path.
+			 */
+			netif_device_detach(dev);
 			netdev_err(priv->dev, "failed reopening the interface after MTU change\n");
 			return ret;
 		}
@@ -6437,6 +6656,7 @@ static int stmmac_change_mtu(struct net_device *dev, int new_mtu)
 		kfree(old_conf);
 
 		stmmac_set_rx_mode(dev);
+		netif_device_attach(dev);
 	}
 
 	WRITE_ONCE(dev->mtu, mtu);
@@ -6471,6 +6691,9 @@ static int stmmac_set_features(struct net_device *netdev,
 			       netdev_features_t features)
 {
 	struct stmmac_priv *priv = netdev_priv(netdev);
+
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
 
 	/* Keep the COE Type in case of csum is supporting */
 	if (features & NETIF_F_RXCSUM)
@@ -6513,7 +6736,7 @@ static void stmmac_common_interrupt(struct stmmac_priv *priv)
 	xmac = dwmac_is_xmac(priv->plat->core_type);
 	queues_count = (rx_cnt > tx_cnt) ? rx_cnt : tx_cnt;
 
-	if (priv->irq_wake)
+	if (READ_ONCE(priv->irq_wake))
 		pm_wakeup_event(priv->device, 0);
 
 	if (priv->dma_cap.estsel)
@@ -6538,8 +6761,10 @@ static void stmmac_common_interrupt(struct stmmac_priv *priv)
 		for (queue = 0; queue < queues_count; queue++)
 			stmmac_host_mtl_irq_status(priv, priv->hw, queue);
 
-		if (!READ_ONCE(priv->ptp_blocked))
-			stmmac_timestamp_interrupt(priv, priv);
+		/* Powered handlers must acknowledge timestamp sources even while
+		 * PHC access is blocked. The callback then skips event delivery.
+		 */
+		stmmac_timestamp_interrupt(priv, priv);
 	}
 }
 
@@ -6558,6 +6783,12 @@ static irqreturn_t stmmac_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = (struct net_device *)dev_id;
 	struct stmmac_priv *priv = netdev_priv(dev);
+
+	if (READ_ONCE(priv->hw_unavailable)) {
+		if (priv->irq_wake)
+			pm_wakeup_event(priv->device, 0);
+		return IRQ_NONE;
+	}
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -6581,6 +6812,12 @@ static irqreturn_t stmmac_mac_interrupt(int irq, void *dev_id)
 	struct net_device *dev = (struct net_device *)dev_id;
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	if (READ_ONCE(priv->hw_unavailable)) {
+		if (priv->irq_wake)
+			pm_wakeup_event(priv->device, 0);
+		return IRQ_NONE;
+	}
+
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
 		return IRQ_HANDLED;
@@ -6595,6 +6832,9 @@ static irqreturn_t stmmac_safety_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = (struct net_device *)dev_id;
 	struct stmmac_priv *priv = netdev_priv(dev);
+
+	if (READ_ONCE(priv->hw_unavailable))
+		return IRQ_NONE;
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -6612,6 +6852,9 @@ static irqreturn_t stmmac_msi_intr_tx(int irq, void *data)
 	struct stmmac_priv *priv = ch->priv_data;
 	int chan = ch->index;
 	int status;
+
+	if (READ_ONCE(priv->hw_unavailable))
+		return IRQ_NONE;
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -6634,6 +6877,9 @@ static irqreturn_t stmmac_msi_intr_rx(int irq, void *data)
 	struct stmmac_channel *ch = data;
 	struct stmmac_priv *priv = ch->priv_data;
 	int chan = ch->index;
+
+	if (READ_ONCE(priv->hw_unavailable))
+		return IRQ_NONE;
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -6666,13 +6912,40 @@ static int stmmac_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 static int stmmac_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 				    void *cb_priv)
 {
+	struct flow_cls_common_offload *common = type_data;
 	struct stmmac_priv *priv = cb_priv;
+	bool active = stmmac_tc_active(priv);
 	int ret = -EOPNOTSUPP;
+	bool destroy;
 
-	if (!tc_cls_can_offload_and_chain0(priv->dev, type_data))
+	switch (type) {
+	case TC_SETUP_CLSU32:
+		destroy = ((struct tc_cls_u32_offload *)type_data)->command ==
+			  TC_CLSU32_DELETE_KNODE;
+		break;
+	case TC_SETUP_CLSFLOWER:
+		destroy = ((struct flow_cls_offload *)type_data)->command ==
+			  FLOW_CLS_DESTROY;
+		break;
+	default:
 		return ret;
+	}
 
-	__stmmac_disable_all_queues(priv);
+	if (common->chain_index) {
+		NL_SET_ERR_MSG(common->extack, "Driver supports only offload of chain 0");
+		return ret;
+	}
+	if (!destroy && !tc_can_offload_extack(priv->dev, common->extack))
+		return ret;
+	if (!destroy && !active)
+		return -ENETDOWN;
+
+	/* TC discards deleted filters regardless of the callback result. Clear
+	 * their cached state even while down or detached, without touching NAPI
+	 * or inaccessible registers. Recovery must not replay deleted rules.
+	 */
+	if (active)
+		__stmmac_disable_all_queues(priv);
 
 	switch (type) {
 	case TC_SETUP_CLSU32:
@@ -6685,7 +6958,8 @@ static int stmmac_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 		break;
 	}
 
-	stmmac_enable_all_queues(priv);
+	if (active)
+		stmmac_enable_all_queues(priv);
 	return ret;
 }
 
@@ -6721,6 +6995,9 @@ static int stmmac_set_mac_address(struct net_device *ndev, void *addr)
 {
 	struct stmmac_priv *priv = netdev_priv(ndev);
 	int ret = 0;
+
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
 
 	ret = pm_runtime_resume_and_get(priv->device);
 	if (ret < 0)
@@ -6773,8 +7050,9 @@ static int stmmac_rings_status_show(struct seq_file *seq, void *v)
 	u8 rx_count, tx_count, queue;
 
 	rtnl_lock();
-	if ((dev->flags & IFF_UP) == 0)
+	if (priv->datapath == STMMAC_DATAPATH_DOWN)
 		goto out_unlock;
+
 	rx_count = priv->plat->rx_queues_to_use;
 	tx_count = priv->plat->tx_queues_to_use;
 
@@ -7100,7 +7378,7 @@ static int stmmac_vlan_update(struct stmmac_priv *priv, bool is_double)
 		hash = 0;
 	}
 
-	if (!netif_running(priv->dev))
+	if (!netif_running(priv->dev) || priv->hw_unavailable)
 		return 0;
 
 	return stmmac_update_vlan_hash(priv, priv->hw, hash, pmatch, is_double);
@@ -7115,6 +7393,9 @@ static int stmmac_vlan_rx_add_vid(struct net_device *ndev, __be16 proto, u16 vid
 	unsigned int num_double_vlans;
 	bool is_double = false;
 	int ret;
+
+	if (priv->hw_unavailable)
+		return -EHOSTDOWN;
 
 	ret = pm_runtime_resume_and_get(priv->device);
 	if (ret < 0)
@@ -7158,9 +7439,12 @@ static int stmmac_vlan_rx_kill_vid(struct net_device *ndev, __be16 proto, u16 vi
 	bool is_double = false;
 	int ret;
 
-	ret = pm_runtime_resume_and_get(priv->device);
-	if (ret < 0)
-		return ret;
+	/* Removal must update the cached filters even if power cannot return. */
+	if (!priv->hw_unavailable) {
+		ret = pm_runtime_resume_and_get(priv->device);
+		if (ret < 0)
+			return ret;
+	}
 
 	if (be16_to_cpu(proto) == ETH_P_8021AD)
 		is_double = true;
@@ -7185,7 +7469,8 @@ static int stmmac_vlan_rx_kill_vid(struct net_device *ndev, __be16 proto, u16 vi
 	priv->num_double_vlans = num_double_vlans;
 
 del_vlan_error:
-	pm_runtime_put(priv->device);
+	if (!priv->hw_unavailable)
+		pm_runtime_put(priv->device);
 
 	return ret;
 }
@@ -7204,6 +7489,22 @@ static void stmmac_vlan_restore(struct stmmac_priv *priv)
 static int stmmac_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
+
+	if (bpf->command != XDP_SETUP_PROG &&
+	    bpf->command != XDP_SETUP_XSK_POOL)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Pool removal must succeed even after a failed resume. Release the
+	 * suspended rings before their pool or XDP buffer layout can change.
+	 * Leave the interface detached until it is closed and reopened.
+	 */
+	if (priv->datapath == STMMAC_DATAPATH_SUSPENDED) {
+		if ((bpf->command == XDP_SETUP_PROG && bpf->prog) ||
+		    (bpf->command == XDP_SETUP_XSK_POOL && bpf->xsk.pool))
+			return -ENETDOWN;
+		__stmmac_release(dev);
+	}
 
 	switch (bpf->command) {
 	case XDP_SETUP_PROG:
@@ -7367,7 +7668,13 @@ void stmmac_xdp_release(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
 
+	netif_device_detach(dev);
+	/* Pause MAC/PCS resolution, but keep the PHY and negotiation running.
+	 * stmmac_xdp_open() completes this replay under the same RTNL lock.
+	 */
+	phylink_replay_link_begin(priv->phylink);
 	stmmac_quiesce(priv);
+	priv->datapath = STMMAC_DATAPATH_DOWN;
 
 	/* Free the IRQ lines */
 	stmmac_free_irq(dev, REQ_IRQ_ERR_ALL, 0);
@@ -7386,7 +7693,13 @@ void stmmac_xdp_release(struct net_device *dev)
 	 * watchdogs during reset
 	 */
 	netif_trans_update(dev);
-	netif_carrier_off(dev);
+
+	if (stmmac_fpe_supported(priv))
+		ethtool_mmsv_stop(&priv->fpe_cfg.mmsv);
+
+	/* Keep PTP across the immediately following stmmac_xdp_open(). That
+	 * function releases it if reopening fails, before returning DOWN.
+	 */
 }
 
 int stmmac_xdp_open(struct net_device *dev)
@@ -7465,21 +7778,25 @@ int stmmac_xdp_open(struct net_device *dev)
 
 	/* Enable NAPI process*/
 	stmmac_enable_all_queues(priv);
-	netif_carrier_on(dev);
-	netif_tx_start_all_queues(dev);
 	stmmac_enable_all_dma_irq(priv);
+	priv->datapath = STMMAC_DATAPATH_RUNNING;
+	phylink_replay_link_end(priv->phylink);
+	netif_device_attach(dev);
 
 	return 0;
 
 irq_error:
+	stmmac_stop_tx_queues(priv);
 	stmmac_stop_all_dma(priv);
-
-	for (chan = 0; chan < priv->plat->tx_queues_to_use; chan++)
-		hrtimer_cancel(&priv->dma_conf->tx_queue[chan].txtimer);
+	stmmac_mac_set(priv, priv->ioaddr, false);
 
 init_error:
 	free_dma_desc_resources(priv, priv->dma_conf);
 dma_desc_error:
+	/* STOPPED keeps replay_end() from reconfiguring a failed MAC. */
+	phylink_stop(priv->phylink);
+	phylink_replay_link_end(priv->phylink);
+	stmmac_release_ptp(priv);
 	return ret;
 }
 
@@ -7605,6 +7922,9 @@ static void stmmac_reset_subtask(struct stmmac_priv *priv)
 	netdev_err(priv->dev, "Reset adapter.\n");
 
 	rtnl_lock();
+	if (!netif_device_present(priv->dev))
+		goto out_unlock;
+
 	netif_trans_update(priv->dev);
 	while (test_and_set_bit(STMMAC_RESETING, &priv->state))
 		usleep_range(1000, 2000);
@@ -7614,6 +7934,7 @@ static void stmmac_reset_subtask(struct stmmac_priv *priv)
 	dev_open(priv->dev, NULL);
 	clear_bit(STMMAC_DOWN, &priv->state);
 	clear_bit(STMMAC_RESETING, &priv->state);
+out_unlock:
 	rtnl_unlock();
 }
 
@@ -7885,13 +8206,37 @@ static void stmmac_napi_del(struct net_device *dev)
 	}
 }
 
-int stmmac_reinit_queues(struct net_device *dev, u8 rx_cnt, u8 tx_cnt)
+/* Rebuild only the datapath. The administratively-up device still owns its
+ * PHY attachment and runtime-PM reference, even if this reopen fails.
+ */
+static int stmmac_reopen(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
-	int ret = 0, i;
+	struct stmmac_dma_conf *old_conf = priv->dma_conf;
+	struct stmmac_dma_conf *dma_conf;
+	int ret;
 
-	if (netif_running(dev))
-		stmmac_release(dev);
+	dma_conf = stmmac_setup_dma_desc(priv, dev->mtu);
+	if (IS_ERR(dma_conf))
+		return PTR_ERR(dma_conf);
+
+	ret = __stmmac_open(dev, dma_conf);
+	if (ret) {
+		priv->dma_conf = old_conf;
+		free_dma_desc_resources(priv, dma_conf);
+		kfree(dma_conf);
+		return ret;
+	}
+
+	kfree(old_conf);
+	netif_device_attach(dev);
+	return 0;
+}
+
+static void stmmac_set_queues(struct net_device *dev, u8 rx_cnt, u8 tx_cnt)
+{
+	struct stmmac_priv *priv = netdev_priv(dev);
+	int i;
 
 	stmmac_napi_del(dev);
 
@@ -7903,9 +8248,31 @@ int stmmac_reinit_queues(struct net_device *dev, u8 rx_cnt, u8 tx_cnt)
 									rx_cnt);
 
 	stmmac_napi_add(dev);
+}
+
+int stmmac_reinit_queues(struct net_device *dev, u8 rx_cnt, u8 tx_cnt)
+{
+	struct stmmac_priv *priv = netdev_priv(dev);
+	u8 old_rx = priv->plat->rx_queues_to_use;
+	u8 old_tx = priv->plat->tx_queues_to_use;
+	int ret = 0;
+
+	if (netif_running(dev)) {
+		if (!netif_device_present(dev))
+			return -ENETDOWN;
+		netif_device_detach(dev);
+		__stmmac_release(dev);
+	}
+
+	stmmac_set_queues(dev, rx_cnt, tx_cnt);
 
 	if (netif_running(dev))
-		ret = stmmac_open(dev);
+		ret = stmmac_reopen(dev);
+	if (ret) {
+		stmmac_set_queues(dev, old_rx, old_tx);
+		netdev_err(dev, "failed reopening after channel change: %pe; interface remains detached\n",
+			   ERR_PTR(ret));
+	}
 
 	return ret;
 }
@@ -7913,16 +8280,28 @@ int stmmac_reinit_queues(struct net_device *dev, u8 rx_cnt, u8 tx_cnt)
 int stmmac_reinit_ringparam(struct net_device *dev, u32 rx_size, u32 tx_size)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
+	u32 old_rx = priv->dma_conf->dma_rx_size;
+	u32 old_tx = priv->dma_conf->dma_tx_size;
 	int ret = 0;
 
-	if (netif_running(dev))
-		stmmac_release(dev);
+	if (netif_running(dev)) {
+		if (!netif_device_present(dev))
+			return -ENETDOWN;
+		netif_device_detach(dev);
+		__stmmac_release(dev);
+	}
 
 	priv->dma_conf->dma_rx_size = rx_size;
 	priv->dma_conf->dma_tx_size = tx_size;
 
 	if (netif_running(dev))
-		ret = stmmac_open(dev);
+		ret = stmmac_reopen(dev);
+	if (ret) {
+		priv->dma_conf->dma_rx_size = old_rx;
+		priv->dma_conf->dma_tx_size = old_tx;
+		netdev_err(dev, "failed reopening after ring change: %pe; interface remains detached\n",
+			   ERR_PTR(ret));
+	}
 
 	return ret;
 }
@@ -8365,6 +8744,7 @@ static int __stmmac_dvr_probe(struct device *device,
 
 	mutex_init(&priv->lock);
 	mutex_init(&priv->est_lock);
+	mutex_init(&priv->pm_mutex);
 	rwlock_init(&priv->ptp_lock);
 	mutex_init(&priv->ptp_mutex);
 
@@ -8510,41 +8890,71 @@ void stmmac_dvr_remove(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(stmmac_dvr_remove);
 
+static void stmmac_block_mmio(struct stmmac_priv *priv)
+{
+	/* Drain MDIO transactions and receive-filter updates before removing
+	 * register power. Both paths can run independently of RTNL.
+	 */
+	if (priv->mii)
+		mutex_lock(&priv->mii->mdio_lock);
+	netif_addr_lock_bh(priv->dev);
+	WRITE_ONCE(priv->hw_unavailable, true);
+	netif_addr_unlock_bh(priv->dev);
+	if (priv->mii)
+		mutex_unlock(&priv->mii->mdio_lock);
+}
+
 /**
- * stmmac_suspend - suspend callback
+ * __stmmac_suspend - suspend callback
  * @dev: device pointer
- * Description: this is the function to suspend the device and it is called
- * by the platform driver to stop the network queue, release the resources,
- * program the PMT register (for WoL), clean and release driver resources.
+ * @bsp_noirq: defer PCI power removal until IRQ handlers are suspended
+ * Description: stop network activity and program hardware for system sleep,
+ * preserving any datapath resources still owned for resume or close.
  */
-int stmmac_suspend(struct device *dev)
+static int __stmmac_suspend(struct device *dev, bool bsp_noirq)
 {
 	struct net_device *ndev = dev_get_drvdata(dev);
 	struct stmmac_priv *priv = netdev_priv(ndev);
+	bool accessible;
+	int ret = 0;
 
-	if (!ndev || !netif_running(ndev))
+	rtnl_lock();
+	if (!netif_running(ndev))
+		goto suspend_bsp;
+
+	/* A failed datapath cannot provide a working MAC wake path. It may
+	 * even have released its wake IRQ. Do not silently suspend without WoL.
+	 */
+	if (priv->wolopts && priv->datapath != STMMAC_DATAPATH_RUNNING) {
+		netdev_err(ndev, "cannot suspend failed datapath with MAC WoL enabled\n");
+		rtnl_unlock();
+		return -EBUSY;
+	}
+	if (priv->hw_suspended)
 		goto suspend_bsp;
 
 	mutex_lock(&priv->lock);
 
 	netif_device_detach(ndev);
 
-	stmmac_quiesce(priv);
+	if (priv->datapath == STMMAC_DATAPATH_RUNNING)
+		stmmac_quiesce(priv);
 
 	if (priv->eee_sw_timer_en) {
 		priv->tx_path_in_lpi_mode = false;
 		timer_delete_sync(&priv->eee_ctrl_timer);
 	}
 
-	/* Stop TX/RX DMA */
 	stmmac_stop_all_dma(priv);
 
-	stmmac_legacy_serdes_power_down(priv);
+	if (!priv->wolopts)
+		stmmac_legacy_serdes_power_down(priv);
 
 	/* Enable Power down mode by programming the PMT regs */
 	if (priv->wolopts) {
+		/* An interrupt can arrive as soon as PMT is armed. */
+		WRITE_ONCE(priv->irq_wake, 1);
 		stmmac_pmt(priv, priv->hw, priv->wolopts);
-		priv->irq_wake = 1;
 	} else {
 		stmmac_mac_set(priv, priv->ioaddr, false);
 		pinctrl_pm_select_sleep_state(priv->device);
@@ -8552,21 +8962,61 @@ int stmmac_suspend(struct device *dev)
 
 	mutex_unlock(&priv->lock);
 
-	rtnl_lock();
 	phylink_suspend(priv->phylink, !!priv->wolopts);
-	rtnl_unlock();
+	if (priv->datapath == STMMAC_DATAPATH_RUNNING)
+		priv->datapath = STMMAC_DATAPATH_SUSPENDED;
+	priv->hw_suspended = true;
 
 	if (stmmac_fpe_supported(priv))
 		ethtool_mmsv_stop(&priv->fpe_cfg.mmsv);
 
 suspend_bsp:
+	accessible = !priv->hw_unavailable;
 	mutex_lock(&priv->ptp_mutex);
 	stmmac_block_ptp(priv, true);
 	mutex_unlock(&priv->ptp_mutex);
-	if (priv->plat->suspend)
-		return priv->plat->suspend(dev, priv->plat->bsp_priv);
+	/* A level PMT interrupt must remain serviceable before suspend_noirq
+	 * and after resume_noirq. Platform MAC WoL retains power; PCI defers
+	 * its power transition to the noirq callbacks instead.
+	 */
+	if (!priv->irq_wake)
+		stmmac_block_mmio(priv);
+	if (priv->datapath == STMMAC_DATAPATH_SUSPENDED) {
+		stmmac_synchronize_irq(priv);
+		stmmac_stop_tx_queues(priv);
+		if (accessible)
+			stmmac_stop_all_dma(priv);
+	}
+	if (bsp_noirq)
+		goto out_unlock;
+	if (priv->irq_wake) {
+		if (priv->plat->suspend_wol && !priv->wol_suspended) {
+			ret = priv->plat->suspend_wol(dev, priv->plat->bsp_priv);
+			if (!ret)
+				priv->wol_suspended = true;
+		}
+	} else if (!priv->bsp_suspended) {
+		if (priv->plat->suspend)
+			ret = priv->plat->suspend(dev, priv->plat->bsp_priv);
+		/* Init-only glue also needs its resume hook after system sleep. */
+		if (!ret && priv->plat->resume)
+			priv->bsp_suspended = true;
+	}
+out_unlock:
+	rtnl_unlock();
 
-	return 0;
+	/* The PM core will not resume a device whose suspend callback failed.
+	 * A failed rollback remains detached for ordinary down/up recovery.
+	 */
+	if (ret && stmmac_resume(dev))
+		netdev_err(ndev, "failed to restore device after suspend failure\n");
+
+	return ret;
+}
+
+int stmmac_suspend(struct device *dev)
+{
+	return __stmmac_suspend(dev, false);
 }
 EXPORT_SYMBOL_GPL(stmmac_suspend);
 
@@ -8618,40 +9068,38 @@ int stmmac_resume(struct device *dev)
 	struct stmmac_priv *priv = netdev_priv(ndev);
 	int ret;
 
-	if (priv->plat->resume) {
-		ret = priv->plat->resume(dev, priv->plat->bsp_priv);
-		if (ret)
-			return ret;
+	rtnl_lock();
+	ret = stmmac_resume_power(priv, true);
+	if (ret)
+		goto out_unlock;
+
+	if (!netif_running(ndev)) {
+		ret = 0;
+		goto out_unlock;
 	}
 
-	if (!netif_running(ndev))
-		return 0;
+	if (priv->hw_suspended) {
+		ret = stmmac_resume_hw(priv);
+		if (ret)
+			goto out_unlock;
 
-	/* Power Down bit, into the PM register, is cleared
-	 * automatically as soon as a magic packet or a Wake-up frame
-	 * is received. Anyway, it's better to manually clear
-	 * this bit because it can generate problems while resuming
-	 * from another devices (e.g. serial console).
-	 */
-	if (priv->wolopts) {
-		mutex_lock(&priv->lock);
-		stmmac_pmt(priv, priv->hw, 0);
-		mutex_unlock(&priv->lock);
-		priv->irq_wake = 0;
-	} else {
-		pinctrl_pm_select_default_state(priv->device);
-		/* reset the phy so that it's ready */
-		if (priv->mii)
-			stmmac_mdio_reset(priv->mii);
+		/* Terminate PM speed control without restarting a datapath
+		 * whose IRQs or rings were released before system sleep.
+		 */
+		if (priv->datapath != STMMAC_DATAPATH_SUSPENDED)
+			phylink_stop(priv->phylink);
+	}
+
+	if (priv->datapath != STMMAC_DATAPATH_SUSPENDED) {
+		ret = 0;
+		goto out_unlock;
 	}
 
 	if (!(priv->plat->flags & STMMAC_FLAG_SERDES_UP_AFTER_PHY_LINKUP)) {
 		ret = stmmac_legacy_serdes_power_up(priv);
 		if (ret < 0)
-			return ret;
+			goto out_unlock;
 	}
-
-	rtnl_lock();
 
 	/* Prepare the PHY to resume, ensuring that its clocks which are
 	 * necessary for the MAC DMA reset to complete are running
@@ -8668,7 +9116,7 @@ int stmmac_resume(struct device *dev)
 	ret = stmmac_hw_setup(ndev);
 	if (ret < 0) {
 		netdev_err(priv->dev, "%s: Hw setup failed\n", __func__);
-		goto error_unlock;
+		goto error_stop_dma;
 	}
 
 	mutex_lock(&priv->ptp_mutex);
@@ -8693,6 +9141,7 @@ int stmmac_resume(struct device *dev)
 
 	stmmac_enable_all_queues(priv);
 	stmmac_enable_all_dma_irq(priv);
+	stmmac_unmask_pci_irq(priv);
 
 	mutex_unlock(&priv->lock);
 
@@ -8701,18 +9150,26 @@ int stmmac_resume(struct device *dev)
 	 * workqueue thread, which will race with initialisation.
 	 */
 	phylink_resume(priv->phylink);
-	rtnl_unlock();
-
+	priv->datapath = STMMAC_DATAPATH_RUNNING;
 	netif_device_attach(ndev);
+	rtnl_unlock();
 
 	return 0;
 
 error_stop_dma:
+	mutex_lock(&priv->ptp_mutex);
+	stmmac_block_ptp(priv, true);
+	mutex_unlock(&priv->ptp_mutex);
 	stmmac_stop_all_dma(priv);
 	stmmac_mac_set(priv, priv->ioaddr, false);
-error_unlock:
 	stmmac_legacy_serdes_power_down(priv);
 	mutex_unlock(&priv->lock);
+	phylink_stop(priv->phylink);
+	/*
+	 * Keep the suspended data path detached. A later resume may retry, or
+	 * ndo_stop() can release its resources without disabling NAPI again.
+	 */
+out_unlock:
 	rtnl_unlock();
 
 	return ret;
@@ -8722,6 +9179,62 @@ EXPORT_SYMBOL_GPL(stmmac_resume);
 /* This is not the same as EXPORT_GPL_SIMPLE_DEV_PM_OPS() when CONFIG_PM=n */
 DEFINE_SIMPLE_DEV_PM_OPS(stmmac_simple_pm_ops, stmmac_suspend, stmmac_resume);
 EXPORT_SYMBOL_GPL(stmmac_simple_pm_ops);
+
+/* PCI config-space power transitions do not need device IRQ handlers. Keep
+ * them inside the noirq window, including PME-based WoL from D3, so the MAC
+ * interrupt can always be acknowledged whenever its handler can run.
+ */
+static int __maybe_unused stmmac_pci_suspend(struct device *dev)
+{
+	return __stmmac_suspend(dev, true);
+}
+
+static int __maybe_unused stmmac_pci_suspend_noirq(struct device *dev)
+{
+	struct stmmac_priv *priv = netdev_priv(dev_get_drvdata(dev));
+	bool unavailable = priv->hw_unavailable;
+	int ret = 0;
+
+	stmmac_block_mmio(priv);
+	if (priv->plat->suspend && !priv->bsp_suspended) {
+		ret = priv->plat->suspend(dev, priv->plat->bsp_priv);
+		if (!ret)
+			priv->bsp_suspended = true;
+		else
+			WRITE_ONCE(priv->hw_unavailable, unavailable);
+	}
+	return ret;
+}
+
+static int __maybe_unused stmmac_pci_resume_noirq(struct device *dev)
+{
+	struct stmmac_priv *priv = netdev_priv(dev_get_drvdata(dev));
+	int ret;
+
+	ret = stmmac_resume_power(priv, true);
+#ifdef CONFIG_PCI
+	if (ret || priv->pci_intx_masked) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+
+		/* Failed restoration must not expose a level PMT interrupt whose
+		 * registers cannot be acknowledged. Mask only this PCI function,
+		 * not the shared controller line, until the datapath recovers.
+		 * MSI/MSI-X are message interrupts, not asserted level lines.
+		 */
+		if (!pdev->msi_enabled && !pdev->msix_enabled) {
+			pci_intx(pdev, false);
+			priv->pci_intx_masked = true;
+		}
+	}
+#endif
+	return ret;
+}
+
+const struct dev_pm_ops stmmac_pci_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(stmmac_pci_suspend, stmmac_resume)
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(stmmac_pci_suspend_noirq, stmmac_pci_resume_noirq)
+};
+EXPORT_SYMBOL_GPL(stmmac_pci_pm_ops);
 
 #ifndef MODULE
 static int __init stmmac_cmdline_opt(char *str)
