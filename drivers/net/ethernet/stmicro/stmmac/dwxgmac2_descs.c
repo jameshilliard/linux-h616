@@ -136,9 +136,11 @@ static int dwxgmac2_get_rx_timestamp_status(void *desc, void *next_desc,
 }
 
 static void dwxgmac2_init_rx_desc(struct dma_desc *p, int disable_rx_ic,
-				  u8 descriptor_mode, int end, int bfsize)
+				  u8 descriptor_mode, int end, int bfsize,
+				  bool own)
 {
-	dwxgmac2_set_rx_owner(p, disable_rx_ic);
+	if (own)
+		dwxgmac2_set_rx_owner(p, disable_rx_ic);
 }
 
 static void dwxgmac2_init_tx_desc(struct dma_desc *p, u8 descriptor_mode,

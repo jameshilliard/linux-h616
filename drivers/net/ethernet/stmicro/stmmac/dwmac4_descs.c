@@ -289,9 +289,11 @@ exit:
 }
 
 static void dwmac4_rd_init_rx_desc(struct dma_desc *p, int disable_rx_ic,
-				   u8 descriptor_mode, int end, int bfsize)
+				   u8 descriptor_mode, int end, int bfsize,
+				   bool own)
 {
-	dwmac4_set_rx_owner(p, disable_rx_ic);
+	if (own)
+		dwmac4_set_rx_owner(p, disable_rx_ic);
 }
 
 static void dwmac4_rd_init_tx_desc(struct dma_desc *p, u8 descriptor_mode,

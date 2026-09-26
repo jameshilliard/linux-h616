@@ -37,9 +37,9 @@ struct dma_edesc;
 
 /* Descriptors helpers */
 struct stmmac_desc_ops {
-	/* DMA RX descriptor ring initialization */
+	/* DMA RX descriptor initialization, optionally granting DMA ownership. */
 	void (*init_rx_desc)(struct dma_desc *p, int disable_rx_ic,
-			     u8 descriptor_mode, int end, int bfsize);
+			     u8 descriptor_mode, int end, int bfsize, bool own);
 	/* DMA TX descriptor ring initialization */
 	void (*init_tx_desc)(struct dma_desc *p, u8 descriptor_mode, int end);
 	/* Invoked by the xmit function to prepare the tx descriptor */
@@ -205,6 +205,8 @@ struct stmmac_dma_ops {
 			 u32 chan);
 	void (*stop_rx)(struct stmmac_priv *priv, void __iomem *ioaddr,
 			u32 chan);
+	/* Called after stopping every channel; must also drain bus accesses. */
+	int (*wait_idle)(struct stmmac_priv *priv, void __iomem *ioaddr);
 	int (*dma_interrupt)(struct stmmac_priv *priv, void __iomem *ioaddr,
 			     struct stmmac_extra_stats *x, u32 chan, u32 dir);
 	/* If supported then get the optional core features */
@@ -269,6 +271,8 @@ struct stmmac_dma_ops {
 	stmmac_do_void_callback(__priv, dma, start_rx, __priv, __args)
 #define stmmac_stop_rx(__priv, __args...) \
 	stmmac_do_void_callback(__priv, dma, stop_rx, __priv, __args)
+#define stmmac_dma_wait_idle(__priv, __args...) \
+	stmmac_do_callback(__priv, dma, wait_idle, __priv, __args)
 #define stmmac_dma_interrupt_status(__priv, __args...) \
 	stmmac_do_callback(__priv, dma, dma_interrupt, __priv, __args)
 #define stmmac_get_hw_feature(__priv, __args...) \
