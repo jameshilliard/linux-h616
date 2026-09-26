@@ -146,6 +146,8 @@ struct stmmac_channel {
 	struct stmmac_priv *priv_data;
 	spinlock_t lock;
 	u32 index;
+	/* Protected by lock; IRQ handlers must not access the DMA rings. */
+	bool irq_quiesced;
 };
 
 struct stmmac_fpe_cfg {
@@ -278,6 +280,8 @@ enum stmmac_datapath_state {
 	STMMAC_DATAPATH_RUNNING,
 	/* Rings and IRQs retained, NAPI disabled, DMA stop requested. */
 	STMMAC_DATAPATH_SUSPENDED,
+	/* Failed MTU rollback: rings retained, but no IRQs or running NAPI. */
+	STMMAC_DATAPATH_HALTED,
 };
 
 struct stmmac_priv {
