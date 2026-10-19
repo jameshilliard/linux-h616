@@ -557,7 +557,7 @@ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
 	int i, j, ret = IRQ_NONE;
 	u32 status;
 
-	for (i = 0; i < sdev->num_pchans / DMA_IRQ_CHAN_NR; i++) {
+	for (i = 0; i < DIV_ROUND_UP(sdev->num_pchans, DMA_IRQ_CHAN_NR); i++) {
 		status = readl(sdev->base + DMA_IRQ_STAT(i));
 		if (!status)
 			continue;
@@ -567,7 +567,8 @@ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
 
 		writel(status, sdev->base + DMA_IRQ_STAT(i));
 
-		for (j = 0; (j < DMA_IRQ_CHAN_NR) && status; j++) {
+		for (j = 0; j < DMA_IRQ_CHAN_NR &&
+		     i * DMA_IRQ_CHAN_NR + j < sdev->num_pchans && status; j++) {
 			pchan = sdev->pchans + i * DMA_IRQ_CHAN_NR + j;
 			vchan = pchan->vchan;
 			if (vchan && (status & vchan->irq_type)) {
