@@ -24,6 +24,7 @@
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 
 #include <asm/byteorder.h>
 
@@ -64,6 +65,10 @@
 struct dw8250_platform_data {
 	u8 usr_reg;
 	u32 cpr_value;
+	unsigned int type;
+	unsigned int rx_maxburst;
+	unsigned int tx_maxburst;
+	bool cyclic_rx;
 	unsigned int quirks;
 };
 
@@ -445,9 +450,11 @@ static int dw8250_handle_irq(struct uart_port *p)
 	 * fire forever.
 	 *
 	 * This problem has only been observed so far when not in DMA mode
-	 * so we limit the workaround only to non-DMA mode.
+	 * so limit the workaround to PIO, including continuous-DMA fallback.
 	 */
-	if (!(quirks & DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ) && !up->dma && rx_timeout) {
+	if (!(quirks & DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ) && rx_timeout &&
+	    (!up->dma || (up->dma->rx_ring && !up->dma->rx_running &&
+			 !up->dma->rx_terminating))) {
 		status = serial_lsr_in(up);
 
 		/*
@@ -779,10 +786,27 @@ static int dw8250_probe(struct platform_device *pdev)
 	if (!data->skip_autocfg)
 		dw8250_setup_port(p);
 
+	if (data->pdata && data->pdata->type) {
+		p->type = data->pdata->type;
+		p->flags |= UPF_FIXED_TYPE;
+	}
+
 	/* If we have a valid fifosize, try hooking up DMA */
 	if (p->fifosize) {
 		data->data.dma.rxconf.src_maxburst = p->fifosize / 4;
+		if (data->pdata && data->pdata->rx_maxburst)
+			data->data.dma.rxconf.src_maxburst = data->pdata->rx_maxburst;
 		data->data.dma.txconf.dst_maxburst = p->fifosize / 4;
+		if (data->pdata && data->pdata->tx_maxburst)
+			data->data.dma.txconf.dst_maxburst = data->pdata->tx_maxburst;
+		if (data->pdata && data->pdata->cyclic_rx) {
+			data->data.dma.cyclic_rx = true;
+			data->data.dma.rx_size = SZ_16K;
+			/* Ceiling on extra batching latency; the poll interval adapts. */
+			data->data.dma.rx_max_delay_ns = NSEC_PER_MSEC / 4;
+			data->data.dma.rxconf.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+			data->data.dma.rxconf.dst_maxburst = 1;
+		}
 		up->dma = &data->data.dma;
 	}
 
@@ -894,6 +918,18 @@ static const struct dw8250_platform_data dw8250_skip_set_rate_data = {
 	.quirks = DW_UART_QUIRK_SKIP_SET_RATE,
 };
 
+static const struct dw8250_platform_data dw8250_h616_data = {
+	.usr_reg = DW_UART_USR,
+	.cpr_value = DW_UART_CPR_FIFO_MODE_FROM_SIZE(256),
+	.type = UART_PORT_SUNXI,
+	/* In DMA mode 0, one received byte can assert the request. */
+	.rx_maxburst = 1,
+	.tx_maxburst = 1,
+	.cyclic_rx = true,
+	.quirks = DW_UART_QUIRK_CPR_VALUE | DW_UART_QUIRK_SKIP_SET_RATE |
+		  DW_UART_QUIRK_NO_DLF,
+};
+
 static const struct dw8250_platform_data dw8250_intc10ee = {
 	.usr_reg = DW_UART_USR,
 	.quirks = DW_UART_QUIRK_IER_KICK,
@@ -915,6 +951,7 @@ static const struct dw8250_platform_data dw8250_tda54 = {
 
 static const struct of_device_id dw8250_of_match[] = {
 	{ .compatible = "snps,dw-apb-uart", .data = &dw8250_dw_apb },
+	{ .compatible = "allwinner,sun50i-h616-uart", .data = &dw8250_h616_data },
 	{ .compatible = "cavium,octeon-3860-uart", .data = &dw8250_octeon_3860_data },
 	{ .compatible = "marvell,armada-38x-uart", .data = &dw8250_armada_38x_data },
 	{ .compatible = "renesas,rzn1-uart", .data = &dw8250_renesas_rzn1_data },

@@ -97,6 +97,7 @@ enum uart_port_type {
 	/* Internal 8250 only */
 	UART_PORT_AIROHA		= 124,
 	UART_PORT_AIROHA_HS		= 125,
+	UART_PORT_SUNXI		= 126,
 };
 
 #define UART_CAP_FIFO	BIT(8)	/* UART has FIFO */
