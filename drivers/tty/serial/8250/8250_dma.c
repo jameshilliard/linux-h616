@@ -271,7 +271,9 @@ int serial8250_request_dma(struct uart_8250_port *p)
 		goto release_rx;
 	}
 
-	dmaengine_slave_config(dma->rxchan, &dma->rxconf);
+	ret = dmaengine_slave_config(dma->rxchan, &dma->rxconf);
+	if (ret)
+		goto release_rx;
 
 	/* Get a channel for TX */
 	dma->txchan = dma_request_slave_channel_compat(mask,
@@ -291,7 +293,9 @@ int serial8250_request_dma(struct uart_8250_port *p)
 		goto err;
 	}
 
-	dmaengine_slave_config(dma->txchan, &dma->txconf);
+	ret = dmaengine_slave_config(dma->txchan, &dma->txconf);
+	if (ret)
+		goto err;
 
 	rx_dev = dmaengine_get_dma_device(dma->rxchan);
 	tx_dev = dmaengine_get_dma_device(dma->txchan);
