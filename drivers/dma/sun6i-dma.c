@@ -598,6 +598,9 @@ static u32 find_burst_size(const u32 burst_lengths, u32 maxburst)
 	if (!maxburst)
 		return 1;
 
+	/* maxburst is a transfer limit, not necessarily a valid bit index. */
+	maxburst = min_t(u32, maxburst, fls(burst_lengths) - 1);
+
 	if (BIT(maxburst) & burst_lengths)
 		return maxburst;
 
