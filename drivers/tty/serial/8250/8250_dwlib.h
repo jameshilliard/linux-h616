@@ -99,6 +99,7 @@ struct dw8250_port_data {
 
 void dw8250_do_set_termios(struct uart_port *p, struct ktermios *termios, const struct ktermios *old);
 void dw8250_setup_port(struct uart_port *p);
+void __dw8250_set_divisor(struct uart_port *p, unsigned int quot_frac);
 
 static inline u32 dw8250_readl_ext(struct uart_port *p, int offset)
 {

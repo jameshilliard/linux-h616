@@ -36,10 +36,20 @@ static unsigned int dw8250_get_divisor(struct uart_port *p, unsigned int baud,
 	return quot;
 }
 
+/* Program the fractional part of the divisor, if the UART has one */
+void __dw8250_set_divisor(struct uart_port *p, unsigned int quot_frac)
+{
+	struct dw8250_port_data *d = p->private_data;
+
+	if (d->dlf_size)
+		dw8250_writel_ext(p, DW_UART_DLF, quot_frac);
+}
+EXPORT_SYMBOL_GPL(__dw8250_set_divisor);
+
 static void dw8250_set_divisor(struct uart_port *p, unsigned int baud,
 			       unsigned int quot, unsigned int quot_frac)
 {
-	dw8250_writel_ext(p, DW_UART_DLF, quot_frac);
+	__dw8250_set_divisor(p, quot_frac);
 	serial8250_do_set_divisor(p, baud, quot);
 }
 
@@ -218,7 +228,9 @@ void dw8250_setup_port(struct uart_port *p)
 	if (reg) {
 		pd->dlf_size = fls(reg);
 		p->get_divisor = dw8250_get_divisor;
-		p->set_divisor = dw8250_set_divisor;
+		/* Keep a hook the driver has already installed */
+		if (!p->set_divisor)
+			p->set_divisor = dw8250_set_divisor;
 	}
 
 	reg = dw8250_readl_ext(p, DW_UART_UCV);
