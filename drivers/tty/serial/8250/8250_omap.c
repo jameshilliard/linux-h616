@@ -780,6 +780,8 @@ static void omap_8250_shutdown(struct uart_port *port)
 
 	/* Synchronize UART_IER access against the console. */
 	scoped_guard(uart_port_lock_irq, port) {
+		if (up->dma)
+			up->dma->shutting_down = true;
 		up->ier = 0;
 		serial_out(up, UART_IER, 0);
 	}
@@ -963,6 +965,8 @@ static void __dma_rx_complete(void *param)
 
 	/* Synchronize UART_IER access against the console. */
 	guard(uart_port_lock_irqsave)(&p->port);
+	if (dma->shutting_down)
+		return;
 
 	/*
 	 * If the tx status is not DMA_COMPLETE, then this is a delayed
@@ -1018,6 +1022,9 @@ static int omap_8250_rx_dma(struct uart_8250_port *p)
 
 	/* Port locked to synchronize UART_IER access against the console. */
 	lockdep_assert_held_once(&p->port.lock);
+
+	if (dma->shutting_down)
+		return 0;
 
 	if (priv->rx_dma_broken)
 		return -EINVAL;
@@ -1080,10 +1087,12 @@ static void omap_8250_dma_tx_complete(void *param)
 	bool			en_thri = false;
 	struct omap8250_priv	*priv = p->port.private_data;
 
+	guard(uart_port_lock_irqsave)(&p->port);
+	if (dma->shutting_down)
+		return;
+
 	dma_sync_single_for_cpu(dmaengine_get_dma_device(dma->txchan), dma->tx_addr,
 				UART_XMIT_SIZE, DMA_TO_DEVICE);
-
-	guard(uart_port_lock_irqsave)(&p->port);
 
 	dma->tx_running = 0;
 
@@ -1123,7 +1132,7 @@ static int omap_8250_tx_dma(struct uart_8250_port *p)
 	int skip_byte = -1;
 	int ret;
 
-	if (dma->tx_running)
+	if (dma->shutting_down || dma->tx_running)
 		return 0;
 	if (uart_tx_stopped(&p->port) || kfifo_is_empty(&tport->xmit_fifo)) {
 
