@@ -19,10 +19,12 @@ static void __dma_tx_complete(void *param)
 	unsigned long	flags;
 	int		ret;
 
+	uart_port_lock_irqsave(&p->port, &flags);
+	if (dma->shutting_down)
+		goto out;
+
 	dma_sync_single_for_cpu(dmaengine_get_dma_device(dma->txchan), dma->tx_addr,
 				UART_XMIT_SIZE, DMA_TO_DEVICE);
-
-	uart_port_lock_irqsave(&p->port, &flags);
 
 	dma->tx_running = 0;
 
@@ -35,6 +37,7 @@ static void __dma_tx_complete(void *param)
 	if (ret || !dma->tx_running)
 		serial8250_set_THRI(p);
 
+out:
 	uart_port_unlock_irqrestore(&p->port, flags);
 }
 
@@ -71,6 +74,8 @@ static void dma_rx_complete(void *param)
 	unsigned long flags;
 
 	uart_port_lock_irqsave(&p->port, &flags);
+	if (dma->shutting_down)
+		goto out;
 	if (dma->rx_running)
 		__dma_rx_complete(p);
 
@@ -80,6 +85,7 @@ static void dma_rx_complete(void *param)
 	 */
 	if (!dma->rx_running && (serial_lsr_in(p) & UART_LSR_DR))
 		p->dma->rx_dma(p);
+out:
 	uart_port_unlock_irqrestore(&p->port, flags);
 }
 
@@ -93,6 +99,9 @@ int serial8250_tx_dma(struct uart_8250_port *p)
 	struct scatterlist		sgl[2];
 	int i;
 	int ret;
+
+	if (dma->shutting_down)
+		return 0;
 
 	if (dma->tx_running) {
 		if (up->x_char) {
@@ -185,7 +194,7 @@ int serial8250_rx_dma(struct uart_8250_port *p)
 	struct uart_8250_dma		*dma = p->dma;
 	struct dma_async_tx_descriptor	*desc;
 
-	if (dma->rx_running)
+	if (dma->shutting_down || dma->rx_running)
 		return 0;
 
 	serial8250_do_prepare_rx_dma(p);
@@ -308,6 +317,8 @@ int serial8250_request_dma(struct uart_8250_port *p)
 		goto err;
 	}
 
+	scoped_guard(uart_port_lock_irqsave, &p->port)
+		dma->shutting_down = false;
 	dev_dbg_ratelimited(p->port.dev, "got both dma channels\n");
 
 	return 0;
