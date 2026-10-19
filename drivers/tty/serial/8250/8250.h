@@ -51,6 +51,8 @@ struct uart_8250_dma {
 	unsigned char		tx_running;
 	unsigned char		tx_err;
 	unsigned char		rx_running;
+	/* Protected by the UART port lock. */
+	bool			shutting_down;
 };
 
 struct old_serial_port {

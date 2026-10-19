@@ -2446,6 +2446,8 @@ void serial8250_do_shutdown(struct uart_port *port)
 	 * Synchronize UART_IER access against the console.
 	 */
 	scoped_guard(uart_port_lock_irqsave, port) {
+		if (up->dma)
+			up->dma->shutting_down = true;
 		up->ier = 0;
 		serial_port_out(port, UART_IER, 0);
 	}
