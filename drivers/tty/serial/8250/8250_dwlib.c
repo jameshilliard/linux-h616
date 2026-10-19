@@ -225,7 +225,11 @@ void dw8250_setup_port(struct uart_port *p)
 	reg = dw8250_readl_ext(p, DW_UART_DLF);
 	dw8250_writel_ext(p, DW_UART_DLF, old_dlf);
 
-	if (reg) {
+	/*
+	 * DLF is a bit field starting at bit 0, so a real one reads back as
+	 * 2^n - 1. Any other value means this offset is something else.
+	 */
+	if (reg && !(reg & (reg + 1))) {
 		pd->dlf_size = fls(reg);
 		p->get_divisor = dw8250_get_divisor;
 		/* Keep a hook the driver has already installed */
