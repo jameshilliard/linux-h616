@@ -23,6 +23,7 @@ struct uart_8250_dma {
 	/* Completion processing with the port lock held. */
 	void (*tx_complete)(struct uart_8250_port *p);
 	struct work_struct tx_flush_work;
+	struct work_struct rx_flush_work;
 	struct uart_8250_port *port;
 
 	/* Filter function */
@@ -52,6 +53,7 @@ struct uart_8250_dma {
 	void			*tx_buf;
 
 	size_t			rx_size;
+	size_t			rx_pos;
 	size_t			tx_size;
 
 	unsigned char		tx_running;
@@ -60,6 +62,7 @@ struct uart_8250_dma {
 	/* Protected by the UART port lock. */
 	bool			shutting_down;
 	bool			tx_terminating;
+	bool			rx_terminating;
 };
 
 struct old_serial_port {
@@ -411,7 +414,7 @@ extern void serial8250_tx_dma_flush(struct uart_8250_port *);
 void serial8250_tx_dma_prepare_buffer(struct uart_8250_port *p,
 				      struct scatterlist *sgl, unsigned int nents);
 extern int serial8250_rx_dma(struct uart_8250_port *);
-extern void serial8250_rx_dma_flush(struct uart_8250_port *);
+int serial8250_rx_dma_flush(struct uart_8250_port *p);
 extern int serial8250_request_dma(struct uart_8250_port *);
 extern void serial8250_release_dma(struct uart_8250_port *);
 
@@ -467,7 +470,7 @@ static inline int serial8250_rx_dma(struct uart_8250_port *p)
 {
 	return -1;
 }
-static inline void serial8250_rx_dma_flush(struct uart_8250_port *p) { }
+static inline int serial8250_rx_dma_flush(struct uart_8250_port *p) { return 0; }
 static inline int serial8250_request_dma(struct uart_8250_port *p)
 {
 	return -1;
