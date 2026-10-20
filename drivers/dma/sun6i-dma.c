@@ -173,11 +173,24 @@ struct sun6i_dma_lli {
 	struct sun6i_dma_lli	*v_lli_next;
 };
 
+/*
+ * Large chains are immutable once submitted. Allocate them a page at a time
+ * and synchronize once, instead of consuming the atomic coherent DMA pool.
+ * Keep allocation metadata outside the memory owned by the device.
+ */
+struct sun6i_lli_page {
+	struct sun6i_lli_page	*next;
+	struct sun6i_dma_lli	*vaddr;
+	dma_addr_t		dma;
+};
+
+#define SUN6I_LLIS_PER_PAGE	(PAGE_SIZE / sizeof(struct sun6i_dma_lli))
 
 struct sun6i_desc {
 	struct virt_dma_desc	vd;
 	dma_addr_t		p_lli;
 	struct sun6i_dma_lli	*v_lli;
+	struct sun6i_lli_page	*lli_pages;
 	bool			cyclic;
 	enum dma_transfer_direction direction;
 };
@@ -421,7 +434,19 @@ static void sun6i_dma_free_desc(struct sun6i_dma_dev *sdev,
 				struct sun6i_desc *txd)
 {
 	struct sun6i_dma_lli *v_lli, *v_next;
+	struct sun6i_lli_page *page, *next;
 	dma_addr_t p_lli, p_next;
+
+	if (txd->lli_pages) {
+		for (page = txd->lli_pages; page; page = next) {
+			next = page->next;
+			dma_free_noncoherent(sdev->slave.dev, PAGE_SIZE,
+					     page->vaddr, page->dma, DMA_TO_DEVICE);
+			kfree(page);
+		}
+		kfree(txd);
+		return;
+	}
 
 	p_lli = txd->p_lli;
 	v_lli = txd->v_lli;
@@ -448,6 +473,43 @@ static void sun6i_dma_free_desc_virt(struct virt_dma_desc *vd)
 		return;
 
 	sun6i_dma_free_desc(sdev, txd);
+}
+
+static struct sun6i_dma_lli *
+sun6i_dma_alloc_paged_lli(struct sun6i_dma_dev *sdev, struct sun6i_desc *txd,
+			  unsigned int index, dma_addr_t *addr)
+{
+	unsigned int offset = index % SUN6I_LLIS_PER_PAGE;
+	struct sun6i_lli_page *page = txd->lli_pages;
+
+	if (!offset) {
+		page = kzalloc_obj(*page, GFP_NOWAIT);
+		if (!page)
+			return NULL;
+
+		page->vaddr = dma_alloc_noncoherent(sdev->slave.dev, PAGE_SIZE,
+						    &page->dma, DMA_TO_DEVICE,
+						    GFP_NOWAIT);
+		if (!page->vaddr) {
+			kfree(page);
+			return NULL;
+		}
+		page->next = txd->lli_pages;
+		txd->lli_pages = page;
+	}
+
+	*addr = page->dma + offset * sizeof(*page->vaddr);
+	return &page->vaddr[offset];
+}
+
+static void sun6i_dma_sync_llis(struct sun6i_dma_dev *sdev,
+			       struct sun6i_desc *txd)
+{
+	struct sun6i_lli_page *page;
+
+	for (page = txd->lli_pages; page; page = page->next)
+		dma_sync_single_for_device(sdev->slave.dev, page->dma, PAGE_SIZE,
+					   DMA_TO_DEVICE);
 }
 
 static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
@@ -850,7 +912,10 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 
 	txd->direction = dir;
 	for (i = 0; i < periods; i++) {
-		v_lli = dma_pool_alloc(sdev->pool, GFP_NOWAIT, &p_lli);
+		if (periods >= SUN6I_LLIS_PER_PAGE)
+			v_lli = sun6i_dma_alloc_paged_lli(sdev, txd, i, &p_lli);
+		else
+			v_lli = dma_pool_alloc(sdev->pool, GFP_NOWAIT, &p_lli);
 		if (!v_lli) {
 			dev_err(sdev->slave.dev, "Failed to alloc lli memory\n");
 			goto err_lli_free;
@@ -889,6 +954,7 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 	}
 
 	prev->p_lli_next = txd->p_lli;		/* cyclic list */
+	sun6i_dma_sync_llis(sdev, txd);
 
 	txd->cyclic = true;
 
