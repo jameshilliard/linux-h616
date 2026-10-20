@@ -77,30 +77,27 @@ void serial8250_tx_dma_prepare_buffer(struct uart_8250_port *p,
 }
 EXPORT_SYMBOL_GPL(serial8250_tx_dma_prepare_buffer);
 
-static void __dma_rx_complete(struct uart_8250_port *p)
+static enum dma_status serial8250_rx_dma_complete(struct uart_8250_port *p)
 {
 	struct uart_8250_dma	*dma = p->dma;
 	struct tty_port		*tty_port = &p->port.state->port;
 	struct dma_tx_state	state;
 	enum dma_status		dma_status;
-	int			count;
+	size_t			count;
 
-	/*
-	 * New DMA Rx can be started during the completion handler before it
-	 * could acquire port's lock and it might still be ongoing. Don't to
-	 * anything in such case.
-	 */
+	/* Only inspect the buffer after completion or a successful pause. */
 	dma_status = dmaengine_tx_status(dma->rxchan, dma->rx_cookie, &state);
-	if (dma_status == DMA_IN_PROGRESS)
-		return;
+	if (dma_status != DMA_COMPLETE && dma_status != DMA_PAUSED)
+		return dma_status;
 
-	count = dma->rx_size - state.residue;
+	count = dma->rx_size - state.residue - dma->rx_pos;
 
-	tty_insert_flip_string(tty_port, dma->rx_buf, count);
+	tty_insert_flip_string(tty_port, dma->rx_buf + dma->rx_pos, count);
 	p->port.icount.rx += count;
-	dma->rx_running = 0;
+	dma->rx_pos += count;
 
 	tty_flip_buffer_push(tty_port);
+	return dma_status;
 }
 
 static void dma_rx_complete(void *param)
@@ -110,19 +107,35 @@ static void dma_rx_complete(void *param)
 	unsigned long flags;
 
 	uart_port_lock_irqsave(&p->port, &flags);
-	if (dma->shutting_down)
+	if (dma->shutting_down || dma->rx_terminating)
 		goto out;
-	if (dma->rx_running)
-		__dma_rx_complete(p);
+	if (dma->rx_running && serial8250_rx_dma_complete(p) == DMA_COMPLETE)
+		dma->rx_running = 0;
 
 	/*
-	 * Cannot be combined with the previous check because __dma_rx_complete()
-	 * changes dma->rx_running.
+	 * The completed transfer no longer owns the receive buffer.
 	 */
-	if (!dma->rx_running && (serial_lsr_in(p) & UART_LSR_DR))
+	if (!dma->rx_running && (p->ier & UART_IER_RDI) &&
+	    (serial_lsr_in(p) & UART_LSR_DR))
 		p->dma->rx_dma(p);
 out:
 	uart_port_unlock_irqrestore(&p->port, flags);
+}
+
+static void serial8250_rx_dma_flush_work(struct work_struct *work)
+{
+	struct uart_8250_dma *dma = container_of(work, struct uart_8250_dma,
+					       rx_flush_work);
+	struct uart_8250_port *p = dma->port;
+
+	dmaengine_synchronize(dma->rxchan);
+
+	guard(uart_port_lock_irqsave)(&p->port);
+	dma->rx_terminating = false;
+	dma->rx_running = 0;
+	if (!dma->shutting_down && (p->ier & UART_IER_RDI) &&
+	    (serial_lsr_in(p) & UART_LSR_DR))
+		dma->rx_dma(p);
 }
 
 int serial8250_tx_dma(struct uart_8250_port *p)
@@ -240,6 +253,7 @@ int serial8250_rx_dma(struct uart_8250_port *p)
 		return -EBUSY;
 
 	dma->rx_running = 1;
+	dma->rx_pos = 0;
 	desc->callback = dma_rx_complete;
 	desc->callback_param = p;
 
@@ -250,16 +264,37 @@ int serial8250_rx_dma(struct uart_8250_port *p)
 	return 0;
 }
 
-void serial8250_rx_dma_flush(struct uart_8250_port *p)
+int serial8250_rx_dma_flush(struct uart_8250_port *p)
 {
 	struct uart_8250_dma *dma = p->dma;
+	enum dma_status status;
+	int ret;
 
-	if (!dma || !dma->rxchan || !dma->rx_running)
-		return;
+	lockdep_assert_held_once(&p->port.lock);
 
-	dmaengine_pause(dma->rxchan);
-	__dma_rx_complete(p);
-	dmaengine_terminate_async(dma->rxchan);
+	if (!dma || !dma->rxchan || !dma->rx_running || dma->rx_terminating)
+		return 0;
+
+	ret = dmaengine_pause(dma->rxchan);
+	if (ret)
+		return ret;
+
+	status = serial8250_rx_dma_complete(p);
+	if (status != DMA_PAUSED && status != DMA_COMPLETE) {
+		dmaengine_resume(dma->rxchan);
+		return -EIO;
+	}
+	dma->rx_terminating = true;
+	ret = dmaengine_terminate_async(dma->rxchan);
+	if (ret) {
+		dma->rx_terminating = false;
+		dmaengine_resume(dma->rxchan);
+		return ret;
+	}
+
+	/* Keep the buffer reserved until any old completion has returned. */
+	schedule_work(&dma->rx_flush_work);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(serial8250_rx_dma_flush);
 
@@ -362,7 +397,9 @@ int serial8250_request_dma(struct uart_8250_port *p)
 
 	dma->port = p;
 	INIT_WORK(&dma->tx_flush_work, serial8250_tx_dma_flush_work);
+	INIT_WORK(&dma->rx_flush_work, serial8250_rx_dma_flush_work);
 	dma->tx_terminating = false;
+	dma->rx_terminating = false;
 
 	scoped_guard(uart_port_lock_irqsave, &p->port)
 		dma->shutting_down = false;
@@ -390,6 +427,7 @@ void serial8250_release_dma(struct uart_8250_port *p)
 		return;
 
 	cancel_work_sync(&dma->tx_flush_work);
+	cancel_work_sync(&dma->rx_flush_work);
 
 	/* Release RX resources */
 	dmaengine_terminate_sync(dma->rxchan);
