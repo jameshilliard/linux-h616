@@ -2983,8 +2983,11 @@ static int clk_core_set_parent_nolock(struct clk_core *core,
 	ret = __clk_speculate_rates(core, p_rate);
 
 	/* abort if a driver objects */
-	if (ret & NOTIFY_STOP_MASK)
+	if (ret & NOTIFY_STOP_MASK) {
+		__clk_recalc_rates(core, true, ABORT_RATE_CHANGE);
+		ret = -EBUSY;
 		goto runtime_put;
+	}
 
 	/* do the re-parent */
 	ret = __clk_set_parent(core, parent, p_index);

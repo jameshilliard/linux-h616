@@ -2364,6 +2364,8 @@ struct clk_mux_notifier_ctx {
 	struct notifier_block clk_nb;
 	struct clk_mux_notifier_rate_change pre_rate_change;
 	struct clk_mux_notifier_rate_change post_rate_change;
+	bool veto;
+	bool aborted;
 };
 
 #define NOTIFIER_TIMEOUT_MS 100
@@ -2381,6 +2383,8 @@ static int clk_mux_notifier_callback(struct notifier_block *nb,
 		ctx->pre_rate_change.new_rate = clk_data->new_rate;
 		ctx->pre_rate_change.done = true;
 		wake_up_interruptible(&ctx->pre_rate_change.wq);
+		if (ctx->veto)
+			return NOTIFY_BAD;
 	}
 
 	if (action & POST_RATE_CHANGE) {
@@ -2390,7 +2394,10 @@ static int clk_mux_notifier_callback(struct notifier_block *nb,
 		wake_up_interruptible(&ctx->post_rate_change.wq);
 	}
 
-	return 0;
+	if (action == ABORT_RATE_CHANGE)
+		ctx->aborted = true;
+
+	return NOTIFY_OK;
 }
 
 static int clk_mux_notifier_test_init(struct kunit *test)
@@ -2488,8 +2495,61 @@ static void clk_mux_notifier_set_parent_test(struct kunit *test)
 	clk_put(clk);
 }
 
+static void clk_mux_notifier_veto_parent_test(struct kunit *test)
+{
+	struct clk_mux_notifier_ctx *ctx = test->priv;
+	struct clk *parent = clk_hw_get_clk(&ctx->mux_ctx.parents_ctx[1].hw, NULL);
+	int ret;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, parent);
+	ctx->veto = true;
+	ret = clk_set_parent(ctx->clk, parent);
+	clk_put(parent);
+
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, ctx->pre_rate_change.done);
+	KUNIT_EXPECT_TRUE(test, ctx->aborted);
+	KUNIT_EXPECT_FALSE(test, ctx->post_rate_change.done);
+	KUNIT_EXPECT_EQ(test, clk_get_rate(ctx->clk), DUMMY_CLOCK_RATE_1);
+	KUNIT_EXPECT_EQ(test, ctx->mux_ctx.current_parent, 0);
+}
+
+static int clk_mux_veto_callback(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	return action == PRE_RATE_CHANGE ? NOTIFY_BAD : NOTIFY_OK;
+}
+
+static void clk_mux_notifier_abort_parent_test(struct kunit *test)
+{
+	struct clk_mux_notifier_ctx *ctx = test->priv;
+	struct notifier_block veto = { .notifier_call = clk_mux_veto_callback };
+	struct clk *parent = clk_hw_get_clk(&ctx->mux_ctx.parents_ctx[1].hw, NULL);
+	int ret;
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, parent);
+	ret = clk_notifier_register(ctx->clk, &veto);
+	if (ret)
+		clk_put(parent);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	/* The first consumer accepts PRE before the second consumer vetoes it. */
+	ret = clk_set_parent(ctx->clk, parent);
+	clk_put(parent);
+	clk_notifier_unregister(ctx->clk, &veto);
+
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, ctx->pre_rate_change.done);
+	KUNIT_EXPECT_TRUE(test, ctx->aborted);
+	KUNIT_EXPECT_FALSE(test, ctx->post_rate_change.done);
+	KUNIT_EXPECT_EQ(test, clk_get_rate(ctx->clk), DUMMY_CLOCK_RATE_1);
+	KUNIT_EXPECT_EQ(test, ctx->mux_ctx.current_parent, 0);
+}
+
 static struct kunit_case clk_mux_notifier_test_cases[] = {
 	KUNIT_CASE(clk_mux_notifier_set_parent_test),
+	KUNIT_CASE(clk_mux_notifier_veto_parent_test),
+	KUNIT_CASE(clk_mux_notifier_abort_parent_test),
 	{}
 };
 
