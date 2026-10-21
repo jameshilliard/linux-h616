@@ -60,7 +60,8 @@ static void __dma_rx_complete(struct uart_8250_port *p)
 
 	count = dma->rx_size - state.residue;
 
-	tty_insert_flip_string(tty_port, dma->rx_buf, count);
+	if (tty_insert_flip_string(tty_port, dma->rx_buf, count) != count)
+		p->port.icount.buf_overrun++;
 	p->port.icount.rx += count;
 	dma->rx_running = 0;
 
