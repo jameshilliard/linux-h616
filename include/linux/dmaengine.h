@@ -200,6 +200,11 @@ struct dma_vec {
  *  transaction is marked with DMA_PREP_REPEAT will cause the new transaction
  *  to never be processed and stay in the issued queue forever. The flag is
  *  ignored if the previous transaction is not a repeated transaction.
+ * @DMA_PREP_INTERRUPT_ONCE: cyclic DEV_TO_MEM notifications are initially
+ *  armed, then masked by the provider before each callback is scheduled.
+ *  The client explicitly rearms with dmaengine_cyclic_notify(). Requires
+ *  DMA_PREP_INTERRUPT and both cyclic_progress and cyclic_notify operations.
+ *  Notification masking must not pause the transfer or delay DMA writes.
  */
 enum dma_ctrl_flags {
 	DMA_PREP_INTERRUPT = (1 << 0),
@@ -212,6 +217,7 @@ enum dma_ctrl_flags {
 	DMA_PREP_CMD = (1 << 7),
 	DMA_PREP_REPEAT = (1 << 8),
 	DMA_PREP_LOAD_EOT = (1 << 9),
+	DMA_PREP_INTERRUPT_ONCE = (1 << 10),
 };
 
 /**
@@ -750,6 +756,22 @@ struct dma_tx_state {
 };
 
 /**
+ * struct dma_cyclic_state - live receive progress for one-shot cyclic DMA
+ * @completed: completed bytes since this descriptor started, modulo 2^32
+ * @in_flight_bytes: maximum bytes DMA may write ahead of @completed
+ *
+ * Completed bytes are committed to memory. The client must still use the
+ * appropriate DMA memory barriers and must prevent an overwritten snapshot
+ * from reaching its consumer. A modulo ring offset alone cannot implement
+ * this contract. Sample often enough to distinguish wraps of @completed;
+ * when that cannot be established, discard the ambiguous data.
+ */
+struct dma_cyclic_state {
+	u32 completed;
+	u32 in_flight_bytes;
+};
+
+/**
  * enum dmaengine_alignment - defines alignment of the DMA async tx
  * buffers
  */
@@ -847,6 +869,10 @@ struct dma_filter {
  * @device_prep_dma_cyclic: prepare a cyclic dma operation suitable for audio.
  *	The function takes a buffer of size buf_len. The callback function will
  *	be called after period_len bytes have been transferred.
+ * @device_cyclic_progress: report committed receive progress, including while
+ *	notifications are masked; see dmaengine_cyclic_progress()
+ * @device_cyclic_notify: mask or rearm one-shot cyclic notifications without
+ *	stopping DMA; see dmaengine_cyclic_notify()
  * @device_prep_interleaved_dma: Transfer expression in a generic way.
  * @device_caps: May be used to override the generic DMA slave capabilities
  *	with per-channel specific ones
@@ -951,6 +977,10 @@ struct dma_device {
 		struct dma_chan *chan, dma_addr_t buf_addr, size_t buf_len,
 		size_t period_len, enum dma_transfer_direction direction,
 		unsigned long flags);
+	int (*device_cyclic_progress)(struct dma_chan *chan, dma_cookie_t cookie,
+				      struct dma_cyclic_state *state);
+	int (*device_cyclic_notify)(struct dma_chan *chan, dma_cookie_t cookie,
+				    bool enable, u32 consumed);
 	struct dma_async_tx_descriptor *(*device_prep_interleaved_dma)(
 		struct dma_chan *chan, struct dma_interleaved_template *xt,
 		unsigned long flags);
@@ -1176,9 +1206,66 @@ static inline struct dma_async_tx_descriptor *dmaengine_prep_dma_cyclic(
 {
 	if (!chan || !chan->device || !chan->device->device_prep_dma_cyclic)
 		return NULL;
+	if (flags & DMA_PREP_INTERRUPT_ONCE &&
+	    (!(flags & DMA_PREP_INTERRUPT) || dir != DMA_DEV_TO_MEM ||
+	     !chan->device->device_cyclic_progress ||
+	     !chan->device->device_cyclic_notify))
+		return NULL;
 
 	return chan->device->device_prep_dma_cyclic(chan, buf_addr, buf_len,
 						period_len, dir, flags);
+}
+
+/**
+ * dmaengine_cyclic_progress - sample a one-shot cyclic receive transfer
+ * @chan: DMA channel
+ * @cookie: submitted descriptor prepared with DMA_PREP_INTERRUPT_ONCE
+ * @state: committed byte count and maximum write-ahead distance
+ *
+ * Callable in atomic context, including from the DMA callback. A queued
+ * descriptor reports zero progress. For a reusable descriptor, termination
+ * followed by dmaengine_synchronize() leaves a stable final count available
+ * until resubmission or release. This lets the client drain the committed
+ * receive tail after DMA has stopped; termination may still discard data
+ * buffered in the DMA engine. Other terminated or mismatched cookies return
+ * an error, never progress from a replacement descriptor. The client must
+ * serialize its calls with submit/terminate/synchronize and synchronize before
+ * reading the final buffer or reusing the descriptor.
+ *
+ * Return: 0 on success, otherwise a negative errno.
+ */
+static inline int dmaengine_cyclic_progress(struct dma_chan *chan,
+					    dma_cookie_t cookie,
+					    struct dma_cyclic_state *state)
+{
+	if (!chan->device->device_cyclic_progress)
+		return -EOPNOTSUPP;
+	return chan->device->device_cyclic_progress(chan, cookie, state);
+}
+
+/**
+ * dmaengine_cyclic_notify - mask or rearm one-shot cyclic notifications
+ * @chan: DMA channel
+ * @cookie: submitted descriptor prepared with DMA_PREP_INTERRUPT_ONCE
+ * @enable: true to arm, false to mask
+ * @consumed: completed-byte count already handled by the client
+ *
+ * Callable in atomic context; never invokes the client callback inline.
+ * Rearming must check progress after enabling notifications. If progress
+ * differs from @consumed, return 1 with notifications masked so the client
+ * services that data itself. Otherwise an arrival racing this call must
+ * result in a notification. Masking does not drain a callback already queued
+ * or running; termination followed by dmaengine_synchronize() does that.
+ *
+ * Return: 0 when masked/armed, 1 for pending data on rearm, or negative errno.
+ */
+static inline int dmaengine_cyclic_notify(struct dma_chan *chan,
+					 dma_cookie_t cookie, bool enable,
+					 u32 consumed)
+{
+	if (!chan->device->device_cyclic_notify)
+		return -EOPNOTSUPP;
+	return chan->device->device_cyclic_notify(chan, cookie, enable, consumed);
 }
 
 static inline struct dma_async_tx_descriptor *dmaengine_prep_interleaved_dma(
