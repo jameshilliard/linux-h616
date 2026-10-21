@@ -93,6 +93,7 @@
 #define DMA_CHAN_CUR_PARA	0x1c
 #define DMA_CHAN_MODE	0x28
 #define DMA_CHAN_MODE_HANDSHAKE	(BIT(2) | BIT(3))
+#define DMA_CHAN_PKG_COUNT	0x30
 
 #define H616_DRQ_UART0	14
 #define H616_DRQ_UART5	19
@@ -190,6 +191,13 @@ struct sun6i_desc {
 	struct virt_dma_desc	vd;
 	dma_addr_t		p_lli;
 	struct sun6i_dma_lli	*v_lli;
+	/* One-shot notifications are rearmed by the cyclic DMA client. */
+	bool			client_poll;
+	bool			notify_armed;
+	u32			period_len;
+	/* Retain final progress across physical-channel reassignment and reuse. */
+	u32			completed;
+	dma_cookie_t		completed_cookie;
 	struct sun6i_lli_page	*lli_pages;
 	bool			cyclic;
 	enum dma_transfer_direction direction;
@@ -254,6 +262,118 @@ static inline struct sun6i_desc *
 to_sun6i_desc(struct dma_async_tx_descriptor *tx)
 {
 	return container_of(tx, struct sun6i_desc, vd.tx);
+}
+
+/* Controller lock nests outside vc.lock, including pending-channel lookup. */
+static struct sun6i_desc *sun6i_dma_cyclic_desc(struct sun6i_vchan *vchan,
+					       dma_cookie_t cookie)
+{
+	struct sun6i_pchan *pchan = vchan->phy;
+	struct virt_dma_desc *vd;
+	struct sun6i_desc *desc;
+
+	if (pchan && pchan->desc && pchan->desc->vd.tx.cookie == cookie)
+		desc = pchan->desc;
+	else {
+		vd = vchan_find_desc(&vchan->vc, cookie);
+		if (!vd) {
+			list_for_each_entry(vd, &vchan->vc.desc_submitted, node)
+				if (vd->tx.cookie == cookie)
+					goto found;
+			list_for_each_entry(vd, &vchan->vc.desc_allocated, node)
+				if (vd->tx.cookie == cookie &&
+				    dmaengine_desc_test_reuse(&vd->tx))
+					goto found;
+			return NULL;
+		}
+found:
+		desc = to_sun6i_desc(&vd->tx);
+	}
+	return desc->client_poll ? desc : NULL;
+}
+
+static u32 sun6i_dma_cyclic_completed(struct sun6i_vchan *vchan,
+				     struct sun6i_desc *desc)
+{
+	struct sun6i_pchan *pchan = vchan->phy;
+
+	if (desc->completed_cookie == desc->vd.tx.cookie)
+		return desc->completed;
+	if (!pchan || pchan->desc != desc)
+		return 0;
+	return readl(pchan->base + DMA_CHAN_PKG_COUNT) * desc->period_len;
+}
+
+static int sun6i_dma_cyclic_progress(struct dma_chan *chan, dma_cookie_t cookie,
+				    struct dma_cyclic_state *state)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_desc *desc;
+	unsigned long flags;
+	int ret = -EINVAL;
+
+	spin_lock_irqsave(&sdev->lock, flags);
+	spin_lock(&vchan->vc.lock);
+	desc = sun6i_dma_cyclic_desc(vchan, cookie);
+	if (desc && !atomic_read(&sdev->tasklet_shutdown)) {
+		state->completed = sun6i_dma_cyclic_completed(vchan, desc);
+		/* H616 can have up to 32 bytes of outstanding bus accesses. */
+		state->in_flight_bytes = 32;
+		ret = 0;
+	}
+	spin_unlock(&vchan->vc.lock);
+	spin_unlock_irqrestore(&sdev->lock, flags);
+	return ret;
+}
+
+static int sun6i_dma_cyclic_notify(struct dma_chan *chan, dma_cookie_t cookie,
+				  bool enable, u32 consumed)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_pchan *pchan;
+	struct sun6i_desc *desc;
+	unsigned long flags;
+	u32 bank, mask, enabled;
+	int ret = -EINVAL;
+
+	spin_lock_irqsave(&sdev->lock, flags);
+	spin_lock(&vchan->vc.lock);
+	desc = sun6i_dma_cyclic_desc(vchan, cookie);
+	if (!desc || desc->completed_cookie == cookie ||
+	    atomic_read(&sdev->tasklet_shutdown))
+		goto unlock;
+
+	desc->notify_armed = enable;
+	pchan = vchan->phy;
+	ret = 0;
+	if (!pchan || pchan->desc != desc) {
+		if (enable && consumed) {
+			desc->notify_armed = false;
+			ret = 1;
+		}
+		goto unlock;
+	}
+	bank = pchan->idx / DMA_IRQ_CHAN_NR;
+	mask = DMA_IRQ_PKG << ((pchan->idx % DMA_IRQ_CHAN_NR) * DMA_IRQ_CHAN_WIDTH);
+	enabled = readl(sdev->base + DMA_IRQ_EN(bank)) & ~mask;
+	writel(enabled, sdev->base + DMA_IRQ_EN(bank));
+	if (!enable)
+		goto unlock;
+
+	writel(mask, sdev->base + DMA_IRQ_STAT(bank));
+	writel(enabled | mask, sdev->base + DMA_IRQ_EN(bank));
+	readl(sdev->base + DMA_IRQ_EN(bank));
+	if (sun6i_dma_cyclic_completed(vchan, desc) != consumed) {
+		writel(enabled, sdev->base + DMA_IRQ_EN(bank));
+		desc->notify_armed = false;
+		ret = 1;
+	}
+unlock:
+	spin_unlock(&vchan->vc.lock);
+	spin_unlock_irqrestore(&sdev->lock, flags);
+	return ret;
 }
 
 static inline void sun6i_dma_dump_com_regs(struct sun6i_dma_dev *sdev)
@@ -512,6 +632,23 @@ static void sun6i_dma_sync_llis(struct sun6i_dma_dev *sdev,
 					   DMA_TO_DEVICE);
 }
 
+/* Both controller and virtual-channel locks are held by the IRQ handler. */
+static void sun6i_dma_cyclic_event(struct sun6i_dma_dev *sdev,
+				  struct sun6i_pchan *pchan)
+{
+	u32 bank = pchan->idx / DMA_IRQ_CHAN_NR;
+	u32 mask = DMA_IRQ_PKG << ((pchan->idx % DMA_IRQ_CHAN_NR) *
+				  DMA_IRQ_CHAN_WIDTH);
+
+	if (pchan->desc->client_poll) {
+		pchan->desc->notify_armed = false;
+		writel(readl(sdev->base + DMA_IRQ_EN(bank)) & ~mask,
+		       sdev->base + DMA_IRQ_EN(bank));
+	}
+
+	vchan_cyclic_callback(&pchan->desc->vd);
+}
+
 static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
 {
 	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(vchan->vc.chan.device);
@@ -548,7 +685,8 @@ static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
 	irq_val = readl(sdev->base + DMA_IRQ_EN(irq_reg));
 	irq_val &= ~((DMA_IRQ_HALF | DMA_IRQ_PKG | DMA_IRQ_QUEUE) <<
 			(irq_offset * DMA_IRQ_CHAN_WIDTH));
-	irq_val |= vchan->irq_type << (irq_offset * DMA_IRQ_CHAN_WIDTH);
+	if (!pchan->desc->client_poll || pchan->desc->notify_armed)
+		irq_val |= vchan->irq_type << (irq_offset * DMA_IRQ_CHAN_WIDTH);
 	writel(irq_val, sdev->base + DMA_IRQ_EN(irq_reg));
 
 	writel(pchan->desc->p_lli, pchan->base + DMA_CHAN_LLI_ADDR);
@@ -631,8 +769,12 @@ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
 	u32 status;
 
 	spin_lock_irqsave(&sdev->lock, flags);
+	if (atomic_read(&sdev->tasklet_shutdown))
+		goto out;
+
 	for (i = 0; i < DIV_ROUND_UP(sdev->num_pchans, DMA_IRQ_CHAN_NR); i++) {
 		status = readl(sdev->base + DMA_IRQ_STAT(i));
+		status &= readl(sdev->base + DMA_IRQ_EN(i));
 		if (!status)
 			continue;
 
@@ -648,10 +790,12 @@ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
 			if (vchan && (status & vchan->irq_type)) {
 				spin_lock(&vchan->vc.lock);
 				if (pchan->desc->cyclic) {
-					vchan_cyclic_callback(&pchan->desc->vd);
+					sun6i_dma_cyclic_event(sdev, pchan);
 				} else {
 					vchan_cookie_complete(&pchan->desc->vd);
 					pchan->done = pchan->desc;
+					/* Cyclic transfers keep their physical channel. */
+					tasklet_schedule(&sdev->task);
 				}
 				spin_unlock(&vchan->vc.lock);
 			}
@@ -659,10 +803,9 @@ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
 			status = status >> DMA_IRQ_CHAN_WIDTH;
 		}
 
-		if (!atomic_read(&sdev->tasklet_shutdown))
-			tasklet_schedule(&sdev->task);
 		ret = IRQ_HANDLED;
 	}
+out:
 	spin_unlock_irqrestore(&sdev->lock, flags);
 
 	return ret;
@@ -897,8 +1040,15 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 	struct sun6i_desc *txd;
 	dma_addr_t p_lli;
 	u32 lli_cfg;
-	unsigned int i, periods = buf_len / period_len;
+	unsigned int i, periods;
 	int ret;
+
+	if (!period_len || !buf_len || buf_len % period_len || buf_len > UINT_MAX)
+		return NULL;
+	if (flags & DMA_PREP_INTERRUPT_ONCE &&
+	    (!sdev->is_h616 || period_len != 1 || dir != DMA_DEV_TO_MEM))
+		return NULL;
+	periods = buf_len / period_len;
 
 	ret = set_config(sdev, sconfig, dir, &lli_cfg);
 	if (ret) {
@@ -957,6 +1107,11 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 	sun6i_dma_sync_llis(sdev, txd);
 
 	txd->cyclic = true;
+	txd->period_len = period_len;
+	if (flags & DMA_PREP_INTERRUPT_ONCE) {
+		txd->client_poll = true;
+		txd->notify_armed = true;
+	}
 
 	return vchan_tx_prep(&vchan->vc, &txd->vd, flags);
 
@@ -1032,6 +1187,7 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
 	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
 	struct sun6i_pchan *pchan;
+	struct virt_dma_desc *vd;
 	u32 irq_reg, irq_shift, irq_mask;
 	unsigned long flags;
 	LIST_HEAD(head);
@@ -1042,7 +1198,7 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 	list_del_init(&vchan->node);
 
 	if (pchan && pchan->desc && pchan->desc != pchan->done) {
-		struct virt_dma_desc *vd = &pchan->desc->vd;
+		vd = &pchan->desc->vd;
 
 		/* A cyclic callback may still hold this descriptor outside vc.lock. */
 		if (pchan->desc->cyclic)
@@ -1071,6 +1227,13 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 			readl(pchan->base + DMA_CHAN_PAUSE);
 			udelay(50);
 		}
+		if (pchan->desc && pchan->desc->client_poll) {
+			struct sun6i_desc *desc = pchan->desc;
+
+			/* H616 clears the package counter when the channel is stopped. */
+			desc->completed = sun6i_dma_cyclic_completed(vchan, desc);
+			desc->completed_cookie = desc->vd.tx.cookie;
+		}
 		writel(DMA_CHAN_ENABLE_STOP, pchan->base + DMA_CHAN_ENABLE);
 		if (sdev->is_h616)
 			readl(pchan->base + DMA_CHAN_ENABLE);
@@ -1087,6 +1250,15 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 		pchan->vchan = NULL;
 		pchan->desc = NULL;
 		pchan->done = NULL;
+	}
+	/* Transfers canceled before assignment have no hardware progress. */
+	list_for_each_entry(vd, &head, node) {
+		struct sun6i_desc *desc = to_sun6i_desc(&vd->tx);
+
+		if (desc->client_poll && desc->completed_cookie != vd->tx.cookie) {
+			desc->completed = 0;
+			desc->completed_cookie = vd->tx.cookie;
+		}
 	}
 
 	spin_unlock(&vchan->vc.lock);
@@ -1205,18 +1377,27 @@ static struct dma_chan *sun6i_dma_of_xlate(struct of_phandle_args *dma_spec,
 
 static inline void sun6i_kill_tasklet(struct sun6i_dma_dev *sdev)
 {
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&sdev->lock, flags);
+	/* Neither an IRQ nor a completion callback may rearm delivery after this. */
+	atomic_inc(&sdev->tasklet_shutdown);
+
 	/* Disable all interrupts from DMA */
 	writel(0, sdev->base + DMA_IRQ_EN(0));
 	writel(0, sdev->base + DMA_IRQ_EN(1));
-
-	/* Prevent spurious interrupts from scheduling the tasklet */
-	atomic_inc(&sdev->tasklet_shutdown);
+	spin_unlock_irqrestore(&sdev->lock, flags);
 
 	/* Make sure we won't have any further interrupts */
 	devm_free_irq(sdev->slave.dev, sdev->irq, sdev);
 
 	/* Actually prevent the tasklet from being scheduled */
 	tasklet_kill(&sdev->task);
+
+	/* Finish event delivery before the caller gates the controller clocks. */
+	for (i = 0; i < sdev->num_vchans; i++)
+		tasklet_kill(&sdev->vchans[i].vc.task);
 }
 
 static inline void sun6i_dma_free(struct sun6i_dma_dev *sdev)
@@ -1508,6 +1689,10 @@ static int sun6i_dma_probe(struct platform_device *pdev)
 	sdc->slave.device_prep_slave_sg		= sun6i_dma_prep_slave_sg;
 	sdc->slave.device_prep_dma_memcpy	= sun6i_dma_prep_dma_memcpy;
 	sdc->slave.device_prep_dma_cyclic	= sun6i_dma_prep_dma_cyclic;
+	if (sdc->is_h616) {
+		sdc->slave.device_cyclic_progress = sun6i_dma_cyclic_progress;
+		sdc->slave.device_cyclic_notify = sun6i_dma_cyclic_notify;
+	}
 	sdc->slave.copy_align			= DMAENGINE_ALIGN_4_BYTES;
 	sdc->slave.device_config		= sun6i_dma_config;
 	sdc->slave.device_pause			= sun6i_dma_pause;
