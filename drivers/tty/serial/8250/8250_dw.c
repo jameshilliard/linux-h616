@@ -17,6 +17,7 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -55,6 +56,14 @@
 #define DW_UART_QUIRK_IER_KICK		BIT(6)
 #define DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ	BIT(7)
 #define DW_UART_QUIRK_NO_DLF		BIT(8)
+#define DW_UART_QUIRK_SUNXI_HALT		BIT(9)
+
+#define SUNXI_UART_HALT		0xa4
+#define SUNXI_UART_HALT_TX		BIT(0)
+#define SUNXI_UART_CHCFG_BUSY	BIT(1)
+#define SUNXI_UART_CHANGE_UPDATE	BIT(2)
+#define SUNXI_UART_DBG_DLL		0xb0
+#define SUNXI_UART_DBG_DLH		0xb4
 
 /*
  * Opt-in coordination for integrations with a shared integer-divisor baudclk.
@@ -107,6 +116,8 @@ struct dw8250_data {
 	unsigned int		baud;
 	unsigned int		rate_request;
 	unsigned int		old_divisor;
+	u32			saved_halt;
+	u32			saved_mcr;
 	bool			quiesced;
 	bool			in_termios;
 	bool			clk_prepared;
@@ -155,6 +166,150 @@ static void dw8250_clk_fail(struct uart_port *p, int error)
 		tty_port_tty_hangup(&p->state->port, false);
 }
 
+static unsigned int dw8250_sunxi_get_divisor(struct uart_port *p)
+{
+	return dw8250_readl_ext(p, SUNXI_UART_DBG_DLL) |
+	       dw8250_readl_ext(p, SUNXI_UART_DBG_DLH) << 8;
+}
+
+static int dw8250_sunxi_update(struct uart_port *p, u32 halt, unsigned int divisor)
+{
+	u64 timeout_us;
+	u32 value;
+
+	/*
+	 * The core updates frame_time before programming the new divisor. Use
+	 * the still-programmed divisor and a worst-case 8-bit, parity, two-stop
+	 * frame instead; changing to a faster baud must not shorten this wait.
+	 */
+	timeout_us = DIV_ROUND_UP_ULL(16ULL * (1 + 8 + 1 + 2) * divisor *
+				    USEC_PER_SEC, p->uartclk);
+	dw8250_writel_ext(p, SUNXI_UART_HALT, halt | SUNXI_UART_CHANGE_UPDATE);
+	/* A frame in progress may delay the shadow-register handoff. */
+	return readl_poll_timeout_atomic(p->membase + SUNXI_UART_HALT, value,
+					!(value & SUNXI_UART_CHANGE_UPDATE), 1,
+					timeout_us + 1);
+}
+
+static int dw8250_sunxi_program_divisor(struct uart_port *p, unsigned int divisor)
+{
+	struct uart_8250_port *up = up_to_u8250p(p);
+	unsigned int old_divisor = dw8250_sunxi_get_divisor(p);
+	u32 halt = dw8250_readl_ext(p, SUNXI_UART_HALT) | SUNXI_UART_CHCFG_BUSY;
+	int ret;
+
+	/* DMA is paused and CPU register accesses are excluded by the port lock. */
+	dw8250_writel_ext(p, SUNXI_UART_HALT, halt);
+	writel(up->lcr | UART_LCR_DLAB, p->membase + (UART_LCR << p->regshift));
+	if (!(readl(p->membase + (UART_LCR << p->regshift)) & UART_LCR_DLAB)) {
+		ret = -EIO;
+		goto restore_lcr;
+	}
+	writel(divisor & 0xff, p->membase + (UART_DLL << p->regshift));
+	writel(divisor >> 8, p->membase + (UART_DLM << p->regshift));
+	ret = dw8250_sunxi_update(p, halt, max(old_divisor, divisor));
+restore_lcr:
+	writel(up->lcr, p->membase + (UART_LCR << p->regshift));
+	if (!ret && dw8250_sunxi_get_divisor(p) != divisor)
+		ret = -EIO;
+	return ret;
+}
+
+static int dw8250_sunxi_quiesce(struct uart_port *p)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+	struct uart_8250_port *up = up_to_u8250p(p);
+	int ret;
+
+	if (d->quiesced)
+		return 0;
+	ret = serial8250_dma_quiesce(up);
+	if (ret)
+		return ret;
+	d->saved_halt = (dw8250_readl_ext(p, SUNXI_UART_HALT) &
+			 ~SUNXI_UART_CHANGE_UPDATE) | SUNXI_UART_CHCFG_BUSY;
+	d->saved_mcr = serial_port_in(p, UART_MCR);
+	d->quiesced = true;
+	writel(0, p->membase + (UART_IER << p->regshift));
+	dw8250_writel_ext(p, SUNXI_UART_HALT, d->saved_halt | SUNXI_UART_HALT_TX);
+	writel(d->saved_mcr | UART_MCR_LOOP, p->membase + (UART_MCR << p->regshift));
+	return 0;
+}
+
+static int dw8250_sunxi_unquiesce(struct uart_port *p)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+	struct uart_8250_port *up = up_to_u8250p(p);
+	int ret;
+
+	if (!d->quiesced)
+		return 0;
+	ret = serial8250_dma_resume(up);
+	if (ret)
+		return ret;
+	d->quiesced = false;
+	/* Preserve modem/interrupt changes made while the clock was prepared. */
+	writel(d->saved_mcr, p->membase + (UART_MCR << p->regshift));
+	dw8250_writel_ext(p, SUNXI_UART_HALT, d->saved_halt);
+	writel(up->ier, p->membase + (UART_IER << p->regshift));
+	return 0;
+}
+
+static void dw8250_sunxi_serial_out(struct uart_port *p, unsigned int offset, u32 value)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+	u32 halt;
+	int ret;
+
+	/* Never change register banks or enqueue more output after a failed update. */
+	if (d->clk_failed) {
+		if (offset == UART_LCR || offset == UART_TX)
+			return;
+		if (offset == UART_IER)
+			value = 0;
+	}
+	if (d->quiesced) {
+		if (offset == UART_IER)
+			return;
+		else if (offset == UART_MCR) {
+			d->saved_mcr = value;
+			value |= UART_MCR_LOOP;
+		}
+	}
+	if (offset != UART_LCR) {
+		writel(value, p->membase + (offset << p->regshift));
+		return;
+	}
+	/* Break and startup LCR writes also need the configure-at-busy bank. */
+	halt = dw8250_readl_ext(p, SUNXI_UART_HALT) | SUNXI_UART_CHCFG_BUSY;
+	dw8250_writel_ext(p, SUNXI_UART_HALT, halt);
+	writel(value, p->membase + (offset << p->regshift));
+	ret = dw8250_sunxi_update(p, halt, dw8250_sunxi_get_divisor(p));
+	if (ret)
+		d->config_error = ret;
+}
+
+static void dw8250_sunxi_set_divisor(struct uart_port *p, unsigned int baud,
+				  unsigned int quot, unsigned int quot_frac)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+	int ret;
+
+	if (d->clk_failed)
+		return;
+	ret = dw8250_sunxi_program_divisor(p, quot);
+	if (ret)
+		d->config_error = ret;
+	else
+		d->baud = baud;
+}
+
+static const struct dw8250_clk_ops dw8250_sunxi_clk_ops = {
+	.quiesce = dw8250_sunxi_quiesce,
+	.get_divisor = dw8250_sunxi_get_divisor,
+	.set_divisor = dw8250_sunxi_program_divisor,
+	.unquiesce = dw8250_sunxi_unquiesce,
+};
 
 static int dw8250_clk_notify(struct notifier_block *nb, unsigned long event,
 				  void *arg)
@@ -705,12 +860,14 @@ static int dw8250_handle_irq(struct uart_port *p)
 {
 	struct uart_8250_port *up = up_to_u8250p(p);
 	struct dw8250_data *d = to_dw8250_data(p->private_data);
-	unsigned int iir = serial_port_in(p, UART_IIR);
-	bool rx_timeout = (iir & 0x3f) == UART_IIR_RX_TIMEOUT;
+	unsigned int iir;
+	bool rx_timeout;
 	unsigned int quirks = d->pdata->quirks;
 	unsigned int status;
 
 	guard(uart_port_lock_check_sysrq_irqsave)(p);
+	iir = serial_port_in(p, UART_IIR);
+	rx_timeout = (iir & 0x3f) == UART_IIR_RX_TIMEOUT;
 
 	switch (FIELD_GET(DW_UART_IIR_IID, iir)) {
 	case UART_IIR_NO_INT:
@@ -734,6 +891,9 @@ static int dw8250_handle_irq(struct uart_port *p)
 	}
 
 	d->no_int_count = 0;
+	/* BUSY is not masked by IER; acknowledge it above even while held. */
+	if (d->quiesced)
+		return 1;
 
 	/*
 	 * There are ways to get Designware-based UARTs into a state where
@@ -914,6 +1074,10 @@ static void dw8250_quirks(struct uart_port *p, struct dw8250_data *data)
 		p->set_termios = dw8250_do_set_termios;
 	if (quirks & DW_UART_QUIRK_NO_DLF)
 		data->data.skip_dlf = true;
+	if (quirks & DW_UART_QUIRK_SUNXI_HALT) {
+		p->serial_out = dw8250_sunxi_serial_out;
+		p->set_divisor = dw8250_sunxi_set_divisor;
+	}
 	if (data->pdata->clk_ops) {
 		p->set_termios = dw8250_shared_clk_set_termios;
 		p->startup = dw8250_shared_clk_startup;
@@ -1121,6 +1285,9 @@ static int dw8250_probe(struct platform_device *pdev)
 	if (data->pdata && data->pdata->clk_ops) {
 		if (!data->clk)
 			return -EINVAL;
+		if ((data->pdata->quirks & DW_UART_QUIRK_SUNXI_HALT) &&
+		    (p->iotype != UPIO_MEM32 || p->regshift != 2))
+			return -EINVAL;
 		p->shutdown = dw8250_shutdown;
 		err = clk_rate_exclusive_get(data->clk);
 		if (err)
@@ -1262,8 +1429,11 @@ static const struct dw8250_platform_data dw8250_h616_data = {
 	.rx_maxburst = 1,
 	.tx_maxburst = 1,
 	.cyclic_rx = true,
-	.quirks = DW_UART_QUIRK_CPR_VALUE | DW_UART_QUIRK_SKIP_SET_RATE |
+	.quirks = DW_UART_QUIRK_CPR_VALUE | DW_UART_QUIRK_SUNXI_HALT |
 		  DW_UART_QUIRK_NO_DLF,
+	.clk_ops = &dw8250_sunxi_clk_ops,
+	/* Keep runtime selection below the failing 288 MHz DMA profile. */
+	.max_uartclk = 192000000,
 };
 
 static const struct dw8250_platform_data dw8250_intc10ee = {
