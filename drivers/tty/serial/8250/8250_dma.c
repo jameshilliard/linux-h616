@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 
 #include "8250.h"
+#include "8250_rx_poll.h"
 
 static void serial8250_tx_dma_complete(struct uart_8250_port *p)
 {
@@ -129,11 +130,20 @@ static void serial8250_rx_dma_flush_work(struct work_struct *work)
 					       rx_flush_work);
 	struct uart_8250_port *p = dma->port;
 
+	if (dma->rx_ring)
+		serial8250_rx_poll_sync(dma->rx_poll);
 	dmaengine_synchronize(dma->rxchan);
 
 	guard(uart_port_lock_irqsave)(&p->port);
+	if (dma->rx_ring)
+		serial8250_rx_ring_complete(p);
 	dma->rx_terminating = false;
 	dma->rx_running = 0;
+	if (dma->rx_ring) {
+		if (!dma->shutting_down)
+			serial8250_rx_ring_start(p);
+		return;
+	}
 	if (!dma->shutting_down && (p->ier & UART_IER_RDI) &&
 	    (serial_lsr_in(p) & UART_LSR_DR))
 		dma->rx_dma(p);
@@ -242,6 +252,9 @@ int serial8250_rx_dma(struct uart_8250_port *p)
 	struct uart_8250_dma		*dma = p->dma;
 	struct dma_async_tx_descriptor	*desc;
 
+	if (dma->rx_ring)
+		return serial8250_rx_ring_start(p);
+
 	if (dma->shutting_down || dma->rx_running)
 		return 0;
 
@@ -275,6 +288,10 @@ int serial8250_rx_dma_flush(struct uart_8250_port *p)
 
 	if (!dma || !dma->rxchan || !dma->rx_running || dma->rx_terminating)
 		return 0;
+	if (dma->rx_ring) {
+		serial8250_rx_ring_flush(p);
+		goto terminate;
+	}
 
 	ret = dmaengine_pause(dma->rxchan);
 	if (ret)
@@ -285,11 +302,13 @@ int serial8250_rx_dma_flush(struct uart_8250_port *p)
 		dmaengine_resume(dma->rxchan);
 		return -EIO;
 	}
+terminate:
 	dma->rx_terminating = true;
 	ret = dmaengine_terminate_async(dma->rxchan);
 	if (ret) {
 		dma->rx_terminating = false;
-		dmaengine_resume(dma->rxchan);
+		if (!dma->rx_ring)
+			dmaengine_resume(dma->rxchan);
 		return ret;
 	}
 
@@ -331,12 +350,16 @@ int serial8250_request_dma(struct uart_8250_port *p)
 	if (!dma->rxchan)
 		return -ENODEV;
 
-	/* 8250 rx dma requires dmaengine driver to support pause/terminate */
+	/* The single-buffer path reads partial transfers only after pausing. */
 	ret = dma_get_slave_caps(dma->rxchan, &caps);
 	if (ret)
 		goto release_rx;
-	if (!caps.cmd_pause || !caps.cmd_terminate ||
-	    caps.residue_granularity == DMA_RESIDUE_GRANULARITY_DESCRIPTOR) {
+	if (dma->cyclic_rx && !caps.descriptor_reuse) {
+		ret = -EOPNOTSUPP;
+		goto release_rx;
+	}
+	if (!caps.cmd_terminate || (!dma->cyclic_rx &&
+	    (!caps.cmd_pause || caps.residue_granularity == DMA_RESIDUE_GRANULARITY_DESCRIPTOR))) {
 		ret = -EINVAL;
 		goto release_rx;
 	}
@@ -395,6 +418,9 @@ int serial8250_request_dma(struct uart_8250_port *p)
 	}
 	dma_sync_single_for_cpu(tx_dev, dma->tx_addr,
 				UART_XMIT_SIZE, DMA_TO_DEVICE);
+	ret = serial8250_rx_ring_request(p);
+	if (ret)
+		goto unmap_tx;
 
 	dma->port = p;
 	INIT_WORK(&dma->tx_flush_work, serial8250_tx_dma_flush_work);
@@ -407,6 +433,8 @@ int serial8250_request_dma(struct uart_8250_port *p)
 	dev_dbg_ratelimited(p->port.dev, "got both dma channels\n");
 
 	return 0;
+unmap_tx:
+	dma_unmap_single(tx_dev, dma->tx_addr, UART_XMIT_SIZE, DMA_TO_DEVICE);
 free_tx:
 	kfree(dma->tx_buf);
 free_rx:
@@ -423,16 +451,27 @@ EXPORT_SYMBOL_GPL(serial8250_request_dma);
 void serial8250_release_dma(struct uart_8250_port *p)
 {
 	struct uart_8250_dma *dma = p->dma;
+	unsigned long flags;
 
 	if (!dma)
 		return;
 
+	if (dma->rx_poll) {
+		uart_port_lock_irqsave(&p->port, &flags);
+		serial8250_rx_poll_stop(dma->rx_poll);
+		uart_port_unlock_irqrestore(&p->port, flags);
+	}
+
 	cancel_work_sync(&dma->tx_flush_work);
 	cancel_work_sync(&dma->rx_flush_work);
+	/* The RX worker also synchronizes the poller; do not do so concurrently. */
+	if (dma->rx_poll)
+		serial8250_rx_poll_sync(dma->rx_poll);
 
 	/* Release RX resources */
 	dmaengine_terminate_sync(dma->rxchan);
 	dma->rx_running = 0;
+	serial8250_rx_ring_release(p);
 	dma_free_coherent(dmaengine_get_dma_device(dma->rxchan), dma->rx_size,
 			  dma->rx_buf, dma->rx_addr);
 	dma_release_channel(dma->rxchan);

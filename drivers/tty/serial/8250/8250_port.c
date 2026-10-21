@@ -641,16 +641,27 @@ int serial8250_em485_config(struct uart_port *port, struct ktermios *termios,
 			    struct serial_rs485 *rs485)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
+	int ret;
+
+	/* TIOCSRS485 need not be followed by a termios change. */
+	serial8250_rx_ring_termios(up, termios, rs485->flags);
 
 	/*
 	 * Both serial8250_em485_init() and serial8250_em485_destroy()
 	 * are idempotent.
 	 */
-	if (rs485->flags & SER_RS485_ENABLED)
-		return serial8250_em485_init(up);
+	if (rs485->flags & SER_RS485_ENABLED) {
+		ret = serial8250_em485_init(up);
+		if (ret)
+			serial8250_rx_ring_termios(up, termios, port->rs485.flags);
+	} else {
+		serial8250_em485_destroy(up);
+		ret = 0;
+	}
 
-	serial8250_em485_destroy(up);
-	return 0;
+	if (up->dma && up->dma->rx_ring)
+		serial8250_rx_ring_start(up);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(serial8250_em485_config);
 
@@ -1306,6 +1317,7 @@ static void serial8250_stop_rx(struct uart_port *port)
 
 	up->ier &= ~(UART_IER_RLSI | UART_IER_RDI);
 	serial_port_out(port, UART_IER, up->ier);
+	serial8250_rx_ring_stop(up);
 }
 
 /**
@@ -1333,7 +1345,7 @@ void serial8250_em485_stop_tx(struct uart_8250_port *p, bool toggle_ier)
 	if (!(p->port.rs485.flags & SER_RS485_RX_DURING_TX)) {
 		serial8250_clear_and_reinit_fifos(p);
 
-		if (toggle_ier) {
+		if (toggle_ier && !(p->dma && p->dma->rx_ring && p->dma->rx_terminating)) {
 			/*
 			 * Port locked to synchronize UART_IER access against
 			 * the console. The lockdep_assert must be restricted
@@ -1836,12 +1848,13 @@ void serial8250_handle_irq_locked(struct uart_port *port, unsigned int iir)
 	lockdep_assert_held_once(&port->lock);
 
 	status = serial_lsr_in(up);
+	skip_rx = serial8250_rx_ring_irq(up, status);
 
 	/*
 	 * Recover from no-data-ready and FIFO error condition to avoid getting
 	 * stuck in the ISR.
 	 */
-	if (!(status & UART_LSR_DR) && (status & UART_LSR_FIFOE))
+	if (!skip_rx && !(status & UART_LSR_DR) && (status & UART_LSR_FIFOE))
 		serial8250_clear_and_reinit_fifos(up);
 
 	/*
@@ -2854,6 +2867,7 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
 	scoped_guard(serial8250_rpm, up) {
 		guard(uart_port_lock_irqsave)(port);
 
+		serial8250_rx_ring_termios(up, termios, port->rs485.flags);
 		up->lcr = lcr;
 		serial8250_set_trigger_for_slow_speed(port, termios, baud);
 		serial8250_set_afe(port, termios);
@@ -2870,6 +2884,8 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
 			port->mctrl |= TIOCM_RTS;
 		}
 		serial8250_set_mctrl(port, port->mctrl);
+		if (up->dma && up->dma->rx_ring)
+			serial8250_rx_ring_start(up);
 	}
 
 	/* Don't rewrite B0 */
