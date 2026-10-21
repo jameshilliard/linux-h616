@@ -92,7 +92,8 @@ static enum dma_status serial8250_rx_dma_complete(struct uart_8250_port *p)
 
 	count = dma->rx_size - state.residue - dma->rx_pos;
 
-	tty_insert_flip_string(tty_port, dma->rx_buf + dma->rx_pos, count);
+	if (tty_insert_flip_string(tty_port, dma->rx_buf + dma->rx_pos, count) != count)
+		p->port.icount.buf_overrun++;
 	p->port.icount.rx += count;
 	dma->rx_pos += count;
 
