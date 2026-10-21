@@ -109,6 +109,7 @@ config SERIAL_8250_PARISC
 config SERIAL_8250_DMA
 	bool "DMA support for 16550 compatible UART controllers" if EXPERT
 	depends on SERIAL_8250 && DMADEVICES=y
+	select IRQ_POLL
 	default SERIAL_8250
 	help
 	  This builds DMA support that can be used with 8250/16650
