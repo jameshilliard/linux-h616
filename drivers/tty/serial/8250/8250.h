@@ -15,6 +15,9 @@
 
 #include "../serial_mctrl_gpio.h"
 
+struct serial8250_rx_poll;
+struct serial8250_rx_ring;
+
 struct uart_8250_dma {
 	int (*tx_dma)(struct uart_8250_port *p);
 	int (*rx_dma)(struct uart_8250_port *p);
@@ -25,6 +28,11 @@ struct uart_8250_dma {
 	struct work_struct tx_flush_work;
 	struct work_struct rx_flush_work;
 	struct uart_8250_port *port;
+	/* Optional continuous-RX service policy; initialized by its backend. */
+	struct serial8250_rx_poll *rx_poll;
+	struct serial8250_rx_ring *rx_ring;
+	bool cyclic_rx;
+	unsigned int rx_max_delay_ns;
 
 	/* Filter function */
 	dma_filter_fn		fn;
@@ -417,6 +425,15 @@ extern int serial8250_rx_dma(struct uart_8250_port *);
 int serial8250_rx_dma_flush(struct uart_8250_port *p);
 extern int serial8250_request_dma(struct uart_8250_port *);
 extern void serial8250_release_dma(struct uart_8250_port *);
+int serial8250_rx_ring_request(struct uart_8250_port *up);
+void serial8250_rx_ring_release(struct uart_8250_port *up);
+int serial8250_rx_ring_start(struct uart_8250_port *up);
+void serial8250_rx_ring_flush(struct uart_8250_port *up);
+void serial8250_rx_ring_complete(struct uart_8250_port *up);
+void serial8250_rx_ring_stop(struct uart_8250_port *up);
+void serial8250_rx_ring_termios(struct uart_8250_port *up, struct ktermios *termios,
+				unsigned int rs485_flags);
+bool serial8250_rx_ring_irq(struct uart_8250_port *up, u16 status);
 
 static inline void serial8250_do_prepare_tx_dma(struct uart_8250_port *p)
 {
@@ -476,6 +493,18 @@ static inline int serial8250_request_dma(struct uart_8250_port *p)
 	return -1;
 }
 static inline void serial8250_release_dma(struct uart_8250_port *p) { }
+static inline void serial8250_rx_ring_stop(struct uart_8250_port *up) { }
+static inline void serial8250_rx_ring_termios(struct uart_8250_port *up,
+					     struct ktermios *termios,
+					     unsigned int rs485_flags) { }
+static inline bool serial8250_rx_ring_irq(struct uart_8250_port *up, u16 status)
+{
+	return false;
+}
+static inline int serial8250_rx_ring_start(struct uart_8250_port *up)
+{
+	return -EOPNOTSUPP;
+}
 
 static inline bool serial8250_tx_dma_running(struct uart_8250_port *p)
 {
