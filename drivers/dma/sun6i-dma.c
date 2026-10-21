@@ -210,6 +210,7 @@ struct sun6i_dma_dev {
 	struct sun6i_pchan	*pchans;
 	struct sun6i_vchan	*vchans;
 	const struct sun6i_dma_config *cfg;
+	bool			needs_pause_on_stop;
 	u32			num_pchans;
 	u32			num_vchans;
 	u32			max_request;
@@ -971,7 +972,21 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 	list_splice_tail_init(&vchan->vc.desc_completed, &head);
 
 	if (pchan) {
+		if (sdev->needs_pause_on_stop) {
+			/*
+			 * H616 can fail to restart after stopping an active handshake
+			 * transfer. Pause requests first and allow in-flight accesses
+			 * to settle before disabling the channel. There is no pause
+			 * acknowledgment. The 50 us margin avoided restart stalls in
+			 * H616 stress tests; it is not a documented hardware bound.
+			 */
+			writel(DMA_CHAN_PAUSE_PAUSE, pchan->base + DMA_CHAN_PAUSE);
+			readl(pchan->base + DMA_CHAN_PAUSE);
+			udelay(50);
+		}
 		writel(DMA_CHAN_ENABLE_STOP, pchan->base + DMA_CHAN_ENABLE);
+		if (sdev->needs_pause_on_stop)
+			readl(pchan->base + DMA_CHAN_ENABLE);
 		writel(DMA_CHAN_PAUSE_RESUME, pchan->base + DMA_CHAN_PAUSE);
 
 		irq_reg = pchan->idx / DMA_IRQ_CHAN_NR;
@@ -1346,6 +1361,7 @@ static int sun6i_dma_probe(struct platform_device *pdev)
 	sdc->cfg = of_device_get_match_data(&pdev->dev);
 	if (!sdc->cfg)
 		return -ENODEV;
+	sdc->needs_pause_on_stop = of_device_is_compatible(np, "allwinner,sun50i-h616-dma");
 
 	sdc->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sdc->base))
