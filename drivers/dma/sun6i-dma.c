@@ -1130,6 +1130,20 @@ static int sun6i_dma_config(struct dma_chan *chan,
 	return 0;
 }
 
+static void sun6i_dma_pause_pchan(struct sun6i_dma_dev *sdev,
+				struct sun6i_pchan *pchan)
+{
+	writel(DMA_CHAN_PAUSE_PAUSE, pchan->base + DMA_CHAN_PAUSE);
+	readl(pchan->base + DMA_CHAN_PAUSE);
+	/*
+	 * H616 has no pause acknowledgment. Use the same settling interval for
+	 * clients changing peripheral registers as for channel termination.
+	 * This is an empirically qualified margin, not a hardware timing bound.
+	 */
+	if (sdev->is_h616)
+		udelay(50);
+}
+
 static int sun6i_dma_pause(struct dma_chan *chan)
 {
 	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
@@ -1143,9 +1157,7 @@ static int sun6i_dma_pause(struct dma_chan *chan)
 	vchan->paused = true;
 	pchan = vchan->phy;
 	if (pchan) {
-		writel(DMA_CHAN_PAUSE_PAUSE,
-		       pchan->base + DMA_CHAN_PAUSE);
-		readl(pchan->base + DMA_CHAN_PAUSE);
+		sun6i_dma_pause_pchan(sdev, pchan);
 	} else {
 		list_del_init(&vchan->node);
 	}
@@ -1223,9 +1235,7 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 			 * acknowledgment. The 50 us margin avoided restart stalls in
 			 * H616 stress tests; it is not a documented hardware bound.
 			 */
-			writel(DMA_CHAN_PAUSE_PAUSE, pchan->base + DMA_CHAN_PAUSE);
-			readl(pchan->base + DMA_CHAN_PAUSE);
-			udelay(50);
+			sun6i_dma_pause_pchan(sdev, pchan);
 		}
 		if (pchan->desc && pchan->desc->client_poll) {
 			struct sun6i_desc *desc = pchan->desc;
