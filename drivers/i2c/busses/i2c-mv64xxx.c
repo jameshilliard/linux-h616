@@ -24,6 +24,7 @@
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/clk.h>
+#include <linux/notifier.h>
 #include <linux/err.h>
 #include <linux/delay.h>
 
@@ -132,8 +133,12 @@ struct mv64xxx_i2c_data {
 	u32			send_stop;
 	u32			block;
 	int			rc;
-	u32			freq_m;
-	u32			freq_n;
+	u32			baud_div;
+	u32			bus_freq;
+	u32			new_baud_div;
+	struct notifier_block	clk_notifier;
+	bool			clk_change_ready;
+	bool			clk_change_locked;
 	struct clk              *clk;
 	struct clk              *reg_clk;
 	wait_queue_head_t	waitq;
@@ -212,7 +217,7 @@ mv64xxx_i2c_hw_init(struct mv64xxx_i2c_data *drv_data)
 	}
 
 	writel(0, drv_data->reg_base + drv_data->reg_offsets.soft_reset);
-	writel(MV64XXX_I2C_BAUD_DIV_M(drv_data->freq_m) | MV64XXX_I2C_BAUD_DIV_N(drv_data->freq_n),
+	writel(READ_ONCE(drv_data->baud_div),
 		drv_data->reg_base + drv_data->reg_offsets.clock);
 	writel(0, drv_data->reg_base + drv_data->reg_offsets.addr);
 	writel(0, drv_data->reg_base + drv_data->reg_offsets.ext_addr);
@@ -751,6 +756,10 @@ mv64xxx_i2c_xfer_core(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 	if (rc)
 		return rc;
 
+	/* The adapter lock excludes rate changes until the transfer finishes. */
+	writel(READ_ONCE(drv_data->baud_div),
+		drv_data->reg_base + drv_data->reg_offsets.clock);
+
 	BUG_ON(drv_data->msgs != NULL);
 	drv_data->msgs = msgs;
 	drv_data->num_msgs = num;
@@ -813,9 +822,9 @@ static const struct of_device_id mv64xxx_i2c_of_match_table[] = {
 MODULE_DEVICE_TABLE(of, mv64xxx_i2c_of_match_table);
 
 #ifdef CONFIG_OF
-static int
+static unsigned long
 mv64xxx_calc_freq(struct mv64xxx_i2c_data *drv_data,
-		  const int tclk, const int n, const int m)
+		  unsigned long tclk, const int n, const int m)
 {
 	if (drv_data->clk_n_base_0)
 		return tclk / (10 * (m + 1) * (1 << n));
@@ -825,26 +834,96 @@ mv64xxx_calc_freq(struct mv64xxx_i2c_data *drv_data,
 
 static bool
 mv64xxx_find_baud_factors(struct mv64xxx_i2c_data *drv_data,
-			  const u32 req_freq, const u32 tclk)
+			  u32 req_freq, unsigned long tclk, u32 *baud_div)
 {
-	int freq, delta, best_delta = INT_MAX;
+	unsigned long freq, best_freq = 0;
 	int m, n;
 
 	for (n = 0; n <= 7; n++)
 		for (m = 0; m <= 15; m++) {
 			freq = mv64xxx_calc_freq(drv_data, tclk, n, m);
-			delta = req_freq - freq;
-			if (delta >= 0 && delta < best_delta) {
-				drv_data->freq_m = m;
-				drv_data->freq_n = n;
-				best_delta = delta;
+			if (freq <= req_freq && freq > best_freq) {
+				*baud_div = MV64XXX_I2C_BAUD_DIV_M(m) |
+					    MV64XXX_I2C_BAUD_DIV_N(n);
+				best_freq = freq;
 			}
-			if (best_delta == 0)
+			if (best_freq && best_freq == req_freq)
 				return true;
 		}
-	if (best_delta == INT_MAX)
-		return false;
-	return true;
+	return best_freq != 0;
+}
+
+static int mv64xxx_i2c_clk_notifier(struct notifier_block *nb,
+				  unsigned long event, void *arg)
+{
+	struct mv64xxx_i2c_data *drv_data =
+		container_of(nb, struct mv64xxx_i2c_data, clk_notifier);
+	struct clk_notifier_data *ndata = arg;
+	struct i2c_adapter *adap = &drv_data->adapter;
+	int active;
+	u32 control;
+
+	switch (event) {
+	case PRE_RATE_CHANGE:
+		/* The adapter's bus lock is not available during registration. */
+		if (!smp_load_acquire(&drv_data->clk_change_ready))
+			return NOTIFY_BAD;
+		if (!mv64xxx_find_baud_factors(drv_data, drv_data->bus_freq,
+					     ndata->new_rate, &drv_data->new_baud_div))
+			return NOTIFY_BAD;
+		/* A transfer can be waiting for the clock framework in runtime PM. */
+		if (!i2c_trylock_bus(adap, I2C_LOCK_ROOT_ADAPTER))
+			return NOTIFY_BAD;
+
+		/* Software completion can precede the STOP reaching the wire. */
+		active = pm_runtime_get_if_active(adap->dev.parent);
+		if (active > 0 || !IS_ENABLED(CONFIG_PM)) {
+			control = readl(drv_data->reg_base + drv_data->reg_offsets.control);
+			if (active > 0)
+				pm_runtime_put(adap->dev.parent);
+			if (control & (MV64XXX_I2C_REG_CONTROL_START |
+				       MV64XXX_I2C_REG_CONTROL_STOP)) {
+				i2c_unlock_bus(adap, I2C_LOCK_ROOT_ADAPTER);
+				return NOTIFY_BAD;
+			}
+		}
+		drv_data->clk_change_locked = true;
+		return NOTIFY_OK;
+	case POST_RATE_CHANGE:
+		/* Runtime resume can read this without holding the adapter lock. */
+		if (drv_data->clk_change_locked)
+			WRITE_ONCE(drv_data->baud_div, drv_data->new_baud_div);
+		fallthrough;
+	case ABORT_RATE_CHANGE:
+		if (drv_data->clk_change_locked) {
+			drv_data->clk_change_locked = false;
+			i2c_unlock_bus(adap, I2C_LOCK_ROOT_ADAPTER);
+		}
+		return NOTIFY_OK;
+	default:
+		return NOTIFY_DONE;
+	}
+}
+
+static int mv64xxx_i2c_init_clk_notifier(struct mv64xxx_i2c_data *drv_data,
+				       struct device *dev)
+{
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_COMMON_CLK) || !drv_data->bus_freq)
+		return 0;
+
+	drv_data->clk_notifier.notifier_call = mv64xxx_i2c_clk_notifier;
+	ret = devm_clk_notifier_register(dev, drv_data->clk, &drv_data->clk_notifier);
+	if (ret)
+		return ret;
+
+	/* A rate change is now vetoed until the adapter is registered. */
+	if (!mv64xxx_find_baud_factors(drv_data, drv_data->bus_freq,
+				     clk_get_rate(drv_data->clk), &drv_data->baud_div))
+		return -EINVAL;
+
+	return 0;
 }
 
 static int
@@ -853,7 +932,8 @@ mv64xxx_of_config(struct mv64xxx_i2c_data *drv_data,
 {
 	const struct mv64xxx_i2c_regs *data;
 	struct device_node *np = dev->of_node;
-	u32 bus_freq, tclk;
+	unsigned long tclk;
+	u32 bus_freq;
 	int rc = 0;
 
 	/* CLK is mandatory when using DT to describe the i2c bus. We
@@ -873,7 +953,8 @@ mv64xxx_of_config(struct mv64xxx_i2c_data *drv_data,
 	    of_device_is_compatible(np, "allwinner,sun6i-a31-i2c"))
 		drv_data->clk_n_base_0 = true;
 
-	if (!mv64xxx_find_baud_factors(drv_data, bus_freq, tclk)) {
+	drv_data->bus_freq = bus_freq;
+	if (!mv64xxx_find_baud_factors(drv_data, bus_freq, tclk, &drv_data->baud_div)) {
 		rc = -EINVAL;
 		goto out;
 	}
@@ -920,6 +1001,12 @@ out:
 	return rc;
 }
 #else /* CONFIG_OF */
+static int mv64xxx_i2c_init_clk_notifier(struct mv64xxx_i2c_data *drv_data,
+				       struct device *dev)
+{
+	return 0;
+}
+
 static int
 mv64xxx_of_config(struct mv64xxx_i2c_data *drv_data,
 		  struct device *dev)
@@ -1018,8 +1105,8 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 		return drv_data->irq;
 
 	if (pdata) {
-		drv_data->freq_m = pdata->freq_m;
-		drv_data->freq_n = pdata->freq_n;
+		drv_data->baud_div = MV64XXX_I2C_BAUD_DIV_M(pdata->freq_m) |
+				     MV64XXX_I2C_BAUD_DIV_N(pdata->freq_n);
 		drv_data->adapter.timeout = msecs_to_jiffies(pdata->timeout);
 		drv_data->offload_enabled = false;
 		memcpy(&drv_data->reg_offsets, &mv64xxx_i2c_regs_mv64xxx, sizeof(drv_data->reg_offsets));
@@ -1041,6 +1128,10 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 	drv_data->adapter.dev.of_node = pd->dev.of_node;
 	platform_set_drvdata(pd, drv_data);
 	i2c_set_adapdata(&drv_data->adapter, drv_data);
+
+	rc = mv64xxx_i2c_init_clk_notifier(drv_data, &pd->dev);
+	if (rc)
+		return dev_err_probe(&pd->dev, rc, "Cannot monitor input clock changes\n");
 
 	pm_runtime_set_autosuspend_delay(&pd->dev, MSEC_PER_SEC);
 	pm_runtime_use_autosuspend(&pd->dev);
@@ -1064,6 +1155,8 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 		goto exit_free_irq;
 	}
 
+	/* Publish the initialized adapter, including its bus lock, to PRE. */
+	smp_store_release(&drv_data->clk_change_ready, true);
 	return 0;
 
 exit_free_irq:
@@ -1081,11 +1174,15 @@ mv64xxx_i2c_remove(struct platform_device *pd)
 {
 	struct mv64xxx_i2c_data		*drv_data = platform_get_drvdata(pd);
 
+	/* Drain notifications before i2c_del_adapter() clears adap->dev. */
+	clk_rate_exclusive_get(drv_data->clk);
+	WRITE_ONCE(drv_data->clk_change_ready, false);
 	i2c_del_adapter(&drv_data->adapter);
 	free_irq(drv_data->irq, drv_data);
 	pm_runtime_disable(&pd->dev);
 	if (!pm_runtime_status_suspended(&pd->dev))
 		mv64xxx_i2c_runtime_suspend(&pd->dev);
+	clk_rate_exclusive_put(drv_data->clk);
 }
 
 static const struct dev_pm_ops mv64xxx_i2c_pm_ops = {
