@@ -71,6 +71,11 @@ struct uart_8250_dma {
 	bool			shutting_down;
 	bool			tx_terminating;
 	bool			rx_terminating;
+	/* Register-bank changes exclude new submissions and x_char writes. */
+	bool			quiesced;
+	bool			rx_paused;
+	bool			tx_paused;
+	bool			rx_poll_paused;
 };
 
 struct old_serial_port {
@@ -424,6 +429,8 @@ void serial8250_tx_dma_prepare_buffer(struct uart_8250_port *p,
 				      struct scatterlist *sgl, unsigned int nents);
 extern int serial8250_rx_dma(struct uart_8250_port *);
 int serial8250_rx_dma_flush(struct uart_8250_port *p);
+int serial8250_dma_quiesce(struct uart_8250_port *p);
+int serial8250_dma_resume(struct uart_8250_port *p);
 extern int serial8250_request_dma(struct uart_8250_port *);
 extern void serial8250_release_dma(struct uart_8250_port *);
 int serial8250_rx_ring_request(struct uart_8250_port *up);
@@ -463,7 +470,7 @@ static inline void serial8250_tx_dma_pause(struct uart_8250_port *p)
 {
 	struct uart_8250_dma *dma = p->dma;
 
-	if (!dma->tx_running || dma->tx_terminating || dma->shutting_down)
+	if (!dma->tx_running || dma->tx_terminating || dma->shutting_down || dma->quiesced)
 		return;
 
 	dmaengine_pause(dma->txchan);
@@ -473,7 +480,7 @@ static inline void serial8250_tx_dma_resume(struct uart_8250_port *p)
 {
 	struct uart_8250_dma *dma = p->dma;
 
-	if (!dma->tx_running || dma->tx_terminating || dma->shutting_down)
+	if (!dma->tx_running || dma->tx_terminating || dma->shutting_down || dma->quiesced)
 		return;
 
 	dmaengine_resume(dma->txchan);
@@ -489,6 +496,8 @@ static inline int serial8250_rx_dma(struct uart_8250_port *p)
 	return -1;
 }
 static inline int serial8250_rx_dma_flush(struct uart_8250_port *p) { return 0; }
+static inline int serial8250_dma_quiesce(struct uart_8250_port *p) { return 0; }
+static inline int serial8250_dma_resume(struct uart_8250_port *p) { return 0; }
 static inline int serial8250_request_dma(struct uart_8250_port *p)
 {
 	return -1;

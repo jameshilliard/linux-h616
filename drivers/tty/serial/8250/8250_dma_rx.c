@@ -271,7 +271,7 @@ int serial8250_rx_ring_start(struct uart_8250_port *up)
 	int ret;
 
 	lockdep_assert_held_once(&up->port.lock);
-	if (dma->shutting_down || dma->rx_running || dma->rx_terminating)
+	if (dma->shutting_down || dma->quiesced || dma->rx_running || dma->rx_terminating)
 		return 0;
 	if (ring->stopped)
 		return ring->enabled ? 0 : -EOPNOTSUPP;

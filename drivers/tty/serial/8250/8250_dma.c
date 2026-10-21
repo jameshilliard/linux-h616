@@ -160,7 +160,7 @@ int serial8250_tx_dma(struct uart_8250_port *p)
 	int i;
 	int ret;
 
-	if (dma->shutting_down)
+	if (dma->shutting_down || dma->quiesced)
 		return 0;
 	if (dma->tx_terminating)
 		return 0;
@@ -244,6 +244,7 @@ void serial8250_tx_dma_flush(struct uart_8250_port *p)
 		dma->tx_terminating = false;
 		return;
 	}
+	dma->tx_paused = false;
 	schedule_work(&dma->tx_flush_work);
 }
 
@@ -255,7 +256,7 @@ int serial8250_rx_dma(struct uart_8250_port *p)
 	if (dma->rx_ring)
 		return serial8250_rx_ring_start(p);
 
-	if (dma->shutting_down || dma->rx_running)
+	if (dma->shutting_down || dma->quiesced || dma->rx_running)
 		return 0;
 
 	serial8250_do_prepare_rx_dma(p);
@@ -299,7 +300,8 @@ int serial8250_rx_dma_flush(struct uart_8250_port *p)
 
 	status = serial8250_rx_dma_complete(p);
 	if (status != DMA_PAUSED && status != DMA_COMPLETE) {
-		dmaengine_resume(dma->rxchan);
+		if (!dma->quiesced)
+			dmaengine_resume(dma->rxchan);
 		return -EIO;
 	}
 terminate:
@@ -307,16 +309,98 @@ terminate:
 	ret = dmaengine_terminate_async(dma->rxchan);
 	if (ret) {
 		dma->rx_terminating = false;
-		if (!dma->rx_ring)
+		if (!dma->rx_ring && !dma->quiesced)
 			dmaengine_resume(dma->rxchan);
 		return ret;
 	}
+	dma->rx_paused = false;
 
 	/* Keep the buffer reserved until any old completion has returned. */
 	schedule_work(&dma->rx_flush_work);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(serial8250_rx_dma_flush);
+
+/*
+ * The caller holds the port lock and excludes startup/shutdown until resume.
+ * Completion accounting may continue, but neither callbacks nor start_tx can
+ * submit another descriptor or write x_char while the register bank is changed.
+ */
+int serial8250_dma_quiesce(struct uart_8250_port *p)
+{
+	struct uart_8250_dma *dma = p->dma;
+	int ret;
+
+	lockdep_assert_held_once(&p->port.lock);
+	if (!dma || !dma->rxchan)
+		return 0;
+	if (dma->shutting_down || dma->tx_terminating || dma->rx_terminating)
+		return -EBUSY;
+	dma->quiesced = true;
+	if (dma->rx_poll && dma->rx_poll->state != SERIAL8250_RX_STOPPED) {
+		dma->rx_poll_paused = true;
+		serial8250_rx_poll_stop(dma->rx_poll);
+	}
+	if (dma->tx_running && !dma->tx_paused) {
+		ret = dmaengine_pause(dma->txchan);
+		if (ret)
+			goto resume;
+		dma->tx_paused = true;
+	}
+	if (dma->rx_running && !dma->rx_paused) {
+		ret = dmaengine_pause(dma->rxchan);
+		if (ret)
+			goto resume;
+		dma->rx_paused = true;
+	}
+	return 0;
+resume:
+	/* A failed resume retains quiesced and the remaining paused flags. */
+	if (serial8250_dma_resume(p))
+		dev_warn_ratelimited(p->port.dev, "cannot resume DMA after failed pause\n");
+	return ret;
+}
+EXPORT_SYMBOL_GPL(serial8250_dma_quiesce);
+
+int serial8250_dma_resume(struct uart_8250_port *p)
+{
+	struct uart_8250_dma *dma = p->dma;
+	int ret;
+
+	lockdep_assert_held_once(&p->port.lock);
+	if (!dma || !dma->quiesced)
+		return 0;
+	if (dma->rx_paused) {
+		ret = dmaengine_resume(dma->rxchan);
+		if (ret)
+			return ret;
+		dma->rx_paused = false;
+	}
+	if (dma->tx_paused) {
+		/* Completion does not necessarily unpause the channel. */
+		ret = dmaengine_resume(dma->txchan);
+		if (ret)
+			return ret;
+		dma->tx_paused = false;
+	}
+	if (dma->rx_poll_paused) {
+		if (dma->rx_running && !dma->rx_terminating && !dma->shutting_down) {
+			ret = serial8250_rx_poll_start(dma->rx_poll);
+			if (ret)
+				return ret;
+		}
+		dma->rx_poll_paused = false;
+	}
+	dma->quiesced = false;
+	if (dma->rx_ring)
+		serial8250_rx_ring_start(p);
+	else if ((p->ier & UART_IER_RDI) && (serial_lsr_in(p) & UART_LSR_DR))
+		dma->rx_dma(p);
+	if (dma->tx_dma(p))
+		serial8250_set_THRI(p);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(serial8250_dma_resume);
 
 int serial8250_request_dma(struct uart_8250_port *p)
 {
@@ -427,6 +511,10 @@ int serial8250_request_dma(struct uart_8250_port *p)
 	INIT_WORK(&dma->rx_flush_work, serial8250_rx_dma_flush_work);
 	dma->tx_terminating = false;
 	dma->rx_terminating = false;
+	dma->quiesced = false;
+	dma->rx_paused = false;
+	dma->tx_paused = false;
+	dma->rx_poll_paused = false;
 
 	scoped_guard(uart_port_lock_irqsave, &p->port)
 		dma->shutting_down = false;
