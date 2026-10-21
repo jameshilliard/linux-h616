@@ -91,6 +91,11 @@
 #define DMA_CHAN_CUR_CNT	0x18
 
 #define DMA_CHAN_CUR_PARA	0x1c
+#define DMA_CHAN_MODE	0x28
+#define DMA_CHAN_MODE_HANDSHAKE	(BIT(2) | BIT(3))
+
+#define H616_DRQ_UART0	14
+#define H616_DRQ_UART5	19
 
 /*
  * LLI address mangling
@@ -174,6 +179,7 @@ struct sun6i_desc {
 	dma_addr_t		p_lli;
 	struct sun6i_dma_lli	*v_lli;
 	bool			cyclic;
+	enum dma_transfer_direction direction;
 };
 
 struct sun6i_pchan {
@@ -210,7 +216,7 @@ struct sun6i_dma_dev {
 	struct sun6i_pchan	*pchans;
 	struct sun6i_vchan	*vchans;
 	const struct sun6i_dma_config *cfg;
-	bool			needs_pause_on_stop;
+	bool			is_h616;
 	u32			num_pchans;
 	u32			num_vchans;
 	u32			max_request;
@@ -477,6 +483,14 @@ static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
 	writel(irq_val, sdev->base + DMA_IRQ_EN(irq_reg));
 
 	writel(pchan->desc->p_lli, pchan->base + DMA_CHAN_LLI_ADDR);
+	if (sdev->is_h616) {
+		/* H616 UARTs default to DMA handshake, not the DMAC's wait mode. */
+		u32 mode = pchan->desc->direction != DMA_MEM_TO_MEM &&
+			   vchan->port >= H616_DRQ_UART0 && vchan->port <= H616_DRQ_UART5 ?
+			   DMA_CHAN_MODE_HANDSHAKE : 0;
+
+		writel(mode, pchan->base + DMA_CHAN_MODE);
+	}
 	writel(DMA_CHAN_ENABLE_START, pchan->base + DMA_CHAN_ENABLE);
 
 	sun6i_dma_dump_com_regs(sdev);
@@ -684,6 +698,7 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_memcpy(
 	if (!txd)
 		return NULL;
 
+	txd->direction = DMA_MEM_TO_MEM;
 	v_lli = dma_pool_alloc(sdev->pool, GFP_DMA32 | GFP_NOWAIT, &p_lli);
 	if (!v_lli) {
 		dev_err(sdev->slave.dev, "Failed to alloc lli memory\n");
@@ -742,6 +757,7 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_slave_sg(
 	if (!txd)
 		return NULL;
 
+	txd->direction = dir;
 	for_each_sg(sgl, sg, sg_len, i) {
 		v_lli = dma_pool_alloc(sdev->pool, GFP_DMA32 | GFP_NOWAIT, &p_lli);
 		if (!v_lli)
@@ -825,6 +841,7 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 	if (!txd)
 		return NULL;
 
+	txd->direction = dir;
 	for (i = 0; i < periods; i++) {
 		v_lli = dma_pool_alloc(sdev->pool, GFP_DMA32 | GFP_NOWAIT, &p_lli);
 		if (!v_lli) {
@@ -972,7 +989,7 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 	list_splice_tail_init(&vchan->vc.desc_completed, &head);
 
 	if (pchan) {
-		if (sdev->needs_pause_on_stop) {
+		if (sdev->is_h616) {
 			/*
 			 * H616 can fail to restart after stopping an active handshake
 			 * transfer. Pause requests first and allow in-flight accesses
@@ -985,7 +1002,7 @@ static int sun6i_dma_terminate_all(struct dma_chan *chan)
 			udelay(50);
 		}
 		writel(DMA_CHAN_ENABLE_STOP, pchan->base + DMA_CHAN_ENABLE);
-		if (sdev->needs_pause_on_stop)
+		if (sdev->is_h616)
 			readl(pchan->base + DMA_CHAN_ENABLE);
 		writel(DMA_CHAN_PAUSE_RESUME, pchan->base + DMA_CHAN_PAUSE);
 
@@ -1361,7 +1378,7 @@ static int sun6i_dma_probe(struct platform_device *pdev)
 	sdc->cfg = of_device_get_match_data(&pdev->dev);
 	if (!sdc->cfg)
 		return -ENODEV;
-	sdc->needs_pause_on_stop = of_device_is_compatible(np, "allwinner,sun50i-h616-dma");
+	sdc->is_h616 = of_device_is_compatible(np, "allwinner,sun50i-h616-dma");
 
 	sdc->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(sdc->base))
