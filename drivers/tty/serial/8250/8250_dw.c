@@ -57,6 +57,18 @@
 #define DW_UART_QUIRK_NO_DLF		BIT(8)
 
 /*
+ * Opt-in coordination for integrations with a shared integer-divisor baudclk.
+ * All callbacks run with the port lock held. quiesce() must prevent register
+ * bank changes from racing CPU or DMA accesses until unquiesce().
+ */
+struct dw8250_clk_ops {
+	int (*quiesce)(struct uart_port *p);
+	unsigned int (*get_divisor)(struct uart_port *p);
+	int (*set_divisor)(struct uart_port *p, unsigned int divisor);
+	int (*unquiesce)(struct uart_port *p);
+};
+
+/*
  * Number of consecutive IIR_NO_INT interrupts required to trigger interrupt
  * storm prevention code.
  */
@@ -70,6 +82,8 @@ struct dw8250_platform_data {
 	unsigned int tx_maxburst;
 	bool cyclic_rx;
 	unsigned int quirks;
+	const struct dw8250_clk_ops *clk_ops;
+	unsigned long max_uartclk;
 };
 
 struct dw8250_data {
@@ -87,11 +101,290 @@ struct dw8250_data {
 	unsigned int		in_idle:1;
 
 	u8			no_int_count;
+
+	struct notifier_block	clk_notifier;
+	/* Shared-clock state, protected by the port lock and CCF rate exclusion. */
+	unsigned int		baud;
+	unsigned int		rate_request;
+	unsigned int		old_divisor;
+	bool			quiesced;
+	bool			in_termios;
+	bool			clk_prepared;
+	bool			clk_pm_ref;
+	bool			clk_failed;
+	int			config_error;
 };
 
 static inline struct dw8250_data *to_dw8250_data(struct dw8250_port_data *data)
 {
 	return container_of(data, struct dw8250_data, data);
+}
+
+static unsigned int dw8250_clk_divisor(unsigned long rate, unsigned int baud)
+{
+	return clamp_t(unsigned long, DIV_ROUND_CLOSEST_ULL(rate, 16ULL * baud),
+		       1, UART_DIV_MAX);
+}
+
+static u64 dw8250_clk_error(unsigned long rate, unsigned int baud,
+			    unsigned int divisor)
+{
+	u64 target = 16ULL * baud * divisor;
+
+	return rate > target ? rate - target : target - rate;
+}
+
+static bool dw8250_clk_baud_ok(unsigned long rate, unsigned int baud)
+{
+	unsigned int divisor = dw8250_clk_divisor(rate, baud);
+
+	/* Do not silently accept a grossly rounded BOTHER request after a veto. */
+	return dw8250_clk_error(rate, baud, divisor) * 100 <=
+	       16ULL * baud * divisor;
+}
+
+/* The port lock excludes I/O until the asynchronous hangup shuts it down. */
+static void dw8250_clk_fail(struct uart_port *p, int error)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+
+	d->config_error = error;
+	d->clk_failed = true;
+	serial_port_out(p, UART_IER, 0);
+	if (p->state)
+		tty_port_tty_hangup(&p->state->port, false);
+}
+
+
+static int dw8250_clk_notify(struct notifier_block *nb, unsigned long event,
+				  void *arg)
+{
+	struct dw8250_data *d = container_of(nb, struct dw8250_data, clk_notifier);
+	struct clk_notifier_data *change = arg;
+	const struct dw8250_clk_ops *ops = d->pdata->clk_ops;
+	struct uart_port *p = &d->data.uport->port;
+	struct uart_8250_port *up = up_to_u8250p(p);
+	unsigned int baud, divisor, old_divisor;
+	unsigned long flags;
+	int active, ret = 0;
+
+	if (event == PRE_RATE_CHANGE) {
+		if (!change->new_rate || change->new_rate > d->pdata->max_uartclk)
+			return NOTIFY_BAD;
+		active = pm_runtime_get_if_active(p->dev);
+		uart_port_lock_irqsave(p, &flags);
+		baud = d->rate_request ?: d->baud;
+		if (!baud || (p->suspended && !d->in_termios) ||
+		    (!active && IS_ENABLED(CONFIG_PM)))
+			goto pre_done;
+		if (d->clk_failed) {
+			ret = -EIO;
+			goto pre_done;
+		}
+		if (active < 0 && IS_ENABLED(CONFIG_PM)) {
+			ret = active;
+			goto pre_done;
+		}
+		divisor = dw8250_clk_divisor(change->new_rate, baud);
+		old_divisor = dw8250_clk_divisor(change->old_rate, baud);
+		if (!d->rate_request &&
+		    dw8250_clk_error(change->new_rate, baud, divisor) * old_divisor >
+		    dw8250_clk_error(change->old_rate, baud, old_divisor) * divisor) {
+			ret = -ERANGE;
+			goto pre_done;
+		}
+		ret = ops->quiesce(p);
+		if (ret) {
+			if (up->dma && up->dma->quiesced)
+				dw8250_clk_fail(p, ret);
+			goto pre_done;
+		}
+		d->old_divisor = ops->get_divisor(p);
+		ret = ops->set_divisor(p, divisor);
+		if (ret) {
+			d->config_error = ops->set_divisor(p, d->old_divisor);
+			if (!d->config_error)
+				d->config_error = ops->unquiesce(p);
+			if (d->config_error)
+				dw8250_clk_fail(p, d->config_error);
+			goto pre_done;
+		}
+		d->clk_prepared = true;
+		d->clk_pm_ref = active > 0;
+		active = 0;
+pre_done:
+		uart_port_unlock_irqrestore(p, flags);
+		if (active > 0)
+			pm_runtime_put(p->dev);
+		return ret ? NOTIFY_BAD : NOTIFY_OK;
+	}
+	if (event != POST_RATE_CHANGE && event != ABORT_RATE_CHANGE)
+		return NOTIFY_DONE;
+
+	uart_port_lock_irqsave(p, &flags);
+	if (event == POST_RATE_CHANGE)
+		p->uartclk = change->new_rate;
+	if (d->clk_prepared) {
+		if (event == ABORT_RATE_CHANGE)
+			ret = ops->set_divisor(p, d->old_divisor);
+		else if (d->rate_request)
+			d->baud = d->rate_request;
+		if (!ret && (event == ABORT_RATE_CHANGE || !d->in_termios))
+			ret = ops->unquiesce(p);
+		if (ret)
+			dw8250_clk_fail(p, ret);
+		d->clk_prepared = false;
+	}
+	active = d->clk_pm_ref;
+	d->clk_pm_ref = false;
+	uart_port_unlock_irqrestore(p, flags);
+	if (active)
+		pm_runtime_put(p->dev);
+	if (ret)
+		dev_err_ratelimited(p->dev, "clock handoff failed: %d\n", ret);
+	return NOTIFY_OK;
+}
+
+static void dw8250_shared_clk_set_termios(struct uart_port *p, struct ktermios *termios,
+				  const struct ktermios *old)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+	const struct dw8250_clk_ops *ops = d->pdata->clk_ops;
+	struct uart_8250_port *up = up_to_u8250p(p);
+	unsigned int baud = tty_termios_baud_rate(termios);
+	unsigned int divisor;
+	unsigned long flags;
+	u64 step = 16ULL * baud;
+	u64 candidate;
+	long rounded, previous = 0;
+	int ret;
+
+	/* Notifiers never take the TTY locks held by this caller. */
+	ret = clk_rate_exclusive_get(d->clk);
+	if (ret)
+		goto reject;
+	if (up->dma && up->dma->rxchan) {
+		flush_work(&up->dma->rx_flush_work);
+		flush_work(&up->dma->tx_flush_work);
+	}
+	uart_port_lock_irqsave(p, &flags);
+	if (d->clk_failed) {
+		ret = -EIO;
+		uart_port_unlock_irqrestore(p, flags);
+		goto put_rate;
+	}
+	d->config_error = 0;
+	d->in_termios = true;
+	d->rate_request = baud;
+	uart_port_unlock_irqrestore(p, flags);
+
+	/*
+	 * Search while the port is running. PRE holds it only for each actual
+	 * transition, and ABORT releases it before trying another candidate.
+	 * Old single-clock DTs retain fixed-rate operation.
+	 */
+	if (baud && d->pclk && !dw8250_clk_baud_ok(p->uartclk, baud)) {
+		for (divisor = 1; divisor <= UART_DIV_MAX; divisor++) {
+			candidate = step * divisor;
+			if (candidate > d->pdata->max_uartclk)
+				break;
+			rounded = clk_round_rate(d->clk, candidate);
+			/* Several divisors can round to the same rejected clock. */
+			if (rounded == previous)
+				continue;
+			previous = rounded;
+			if (rounded <= 0 || rounded > d->pdata->max_uartclk ||
+			    !dw8250_clk_baud_ok(rounded, baud))
+				continue;
+			if (!clk_set_rate(d->clk, rounded))
+				break;
+			if (d->config_error)
+				break;
+		}
+	}
+	uart_port_lock_irqsave(p, &flags);
+	d->rate_request = 0;
+	ret = d->config_error;
+	if (!ret)
+		ret = ops->quiesce(p);
+	if (ret) {
+		d->in_termios = false;
+		if (up->dma && up->dma->quiesced)
+			dw8250_clk_fail(p, ret);
+	}
+	uart_port_unlock_irqrestore(p, flags);
+	if (ret)
+		goto put_rate;
+	if (baud && !dw8250_clk_baud_ok(p->uartclk, baud)) {
+		baud = d->baud ?: 9600;
+		tty_termios_encode_baud_rate(termios, baud, baud);
+	}
+	dw8250_do_set_termios(p, termios, old);
+	uart_port_lock_irqsave(p, &flags);
+	d->in_termios = false;
+	ret = d->config_error;
+	if (!ret)
+		ret = ops->unquiesce(p);
+	if (ret)
+		dw8250_clk_fail(p, ret);
+	uart_port_unlock_irqrestore(p, flags);
+put_rate:
+	clk_rate_exclusive_put(d->clk);
+reject:
+	if (ret) {
+		/* A failed hardware update hangs up, rather than claiming rollback. */
+		if (old && !d->clk_failed)
+			*termios = *old;
+		dev_warn_ratelimited(p->dev, "cannot change UART configuration: %d\n", ret);
+	}
+}
+
+static int dw8250_shared_clk_startup(struct uart_port *p)
+{
+	struct dw8250_data *d = to_dw8250_data(p->private_data);
+	unsigned long flags;
+	int ret;
+
+	ret = clk_rate_exclusive_get(d->clk);
+	if (ret)
+		return ret;
+	if (d->clk_failed) {
+		/* Shutdown retired the old DMA channels before this new open. */
+		if (!d->rst) {
+			ret = -EIO;
+			goto put_rate;
+		}
+		ret = reset_control_assert(d->rst);
+		if (ret)
+			goto put_rate;
+		ret = reset_control_deassert(d->rst);
+		if (ret)
+			goto put_rate;
+		uart_port_lock_irqsave(p, &flags);
+		ret = d->pdata->clk_ops->set_divisor(p,
+				dw8250_clk_divisor(p->uartclk, d->baud ?: 9600));
+		if (!ret) {
+			d->quiesced = false;
+			d->clk_failed = false;
+			d->config_error = 0;
+		}
+		uart_port_unlock_irqrestore(p, flags);
+		if (ret)
+			goto put_rate;
+	}
+	ret = serial8250_do_startup(p);
+	if (!ret) {
+		uart_port_lock_irqsave(p, &flags);
+		ret = d->config_error;
+		if (ret)
+			dw8250_clk_fail(p, ret);
+		uart_port_unlock_irqrestore(p, flags);
+		if (ret)
+			serial8250_do_shutdown(p);
+	}
+put_rate:
+	clk_rate_exclusive_put(d->clk);
+	return ret;
 }
 
 static inline u32 dw8250_modify_msr(struct uart_port *p, unsigned int offset, u32 value)
@@ -621,6 +914,10 @@ static void dw8250_quirks(struct uart_port *p, struct dw8250_data *data)
 		p->set_termios = dw8250_do_set_termios;
 	if (quirks & DW_UART_QUIRK_NO_DLF)
 		data->data.skip_dlf = true;
+	if (data->pdata->clk_ops) {
+		p->set_termios = dw8250_shared_clk_set_termios;
+		p->startup = dw8250_shared_clk_startup;
+	}
 	if (quirks & DW_UART_QUIRK_IS_DMA_FC) {
 		data->data.dma.txconf.device_fc = 1;
 		data->data.dma.rxconf.device_fc = 1;
@@ -643,9 +940,20 @@ static void dw8250_reset_control_assert(void *data)
 static void dw8250_shutdown(struct uart_port *port)
 {
 	struct dw8250_data *d = to_dw8250_data(port->private_data);
+	bool shared_clk = d->pdata && d->pdata->clk_ops;
+	unsigned long flags;
 
+	if (shared_clk)
+		clk_rate_exclusive_get(d->clk);
 	serial8250_do_shutdown(port);
 	d->no_int_count = 0;
+	if (shared_clk) {
+		uart_port_lock_irqsave(port, &flags);
+		if (!uart_console(port))
+			d->baud = 0;
+		uart_port_unlock_irqrestore(port, flags);
+		clk_rate_exclusive_put(d->clk);
+	}
 }
 
 static int dw8250_probe(struct platform_device *pdev)
@@ -810,15 +1118,37 @@ static int dw8250_probe(struct platform_device *pdev)
 		up->dma = &data->data.dma;
 	}
 
+	if (data->pdata && data->pdata->clk_ops) {
+		if (!data->clk)
+			return -EINVAL;
+		p->shutdown = dw8250_shutdown;
+		err = clk_rate_exclusive_get(data->clk);
+		if (err)
+			return err;
+	}
 	data->data.uport = serial8250_register_8250_port(up);
-	if (IS_ERR(data->data.uport))
-		return PTR_ERR(data->data.uport);
+	if (IS_ERR(data->data.uport)) {
+		err = PTR_ERR(data->data.uport);
+		goto put_rate;
+	}
+	if (data->pdata && data->pdata->clk_ops) {
+		data->clk_notifier.notifier_call = dw8250_clk_notify;
+		err = clk_notifier_register(data->clk, &data->clk_notifier);
+		if (err) {
+			serial8250_unregister_port(data->data.uport);
+			goto put_rate;
+		}
+	}
 
 	platform_set_drvdata(pdev, data);
 
 	pm_runtime_enable(dev);
 
-	return 0;
+	err = 0;
+put_rate:
+	if (data->pdata && data->pdata->clk_ops)
+		clk_rate_exclusive_put(data->clk);
+	return err;
 }
 
 static void dw8250_remove(struct platform_device *pdev)
@@ -828,7 +1158,13 @@ static void dw8250_remove(struct platform_device *pdev)
 
 	pm_runtime_get_sync(dev);
 
+	if (data->pdata && data->pdata->clk_ops) {
+		clk_rate_exclusive_get(data->clk);
+		clk_notifier_unregister(data->clk, &data->clk_notifier);
+	}
 	serial8250_unregister_port(data->data.uport);
+	if (data->pdata && data->pdata->clk_ops)
+		clk_rate_exclusive_put(data->clk);
 
 	pm_runtime_disable(dev);
 	pm_runtime_put_noidle(dev);
