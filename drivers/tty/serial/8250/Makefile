@@ -11,7 +11,7 @@ obj-$(CONFIG_SERIAL_8250)		+= 8250.o
 
 obj-$(CONFIG_SERIAL_8250)		+= 8250_base.o
 8250_base-y				:= 8250_port.o
-8250_base-$(CONFIG_SERIAL_8250_DMA)	+= 8250_dma.o
+8250_base-$(CONFIG_SERIAL_8250_DMA)	+= 8250_dma.o 8250_rx_poll.o
 8250_base-$(CONFIG_SERIAL_8250_DWLIB)	+= 8250_dwlib.o
 8250_base-$(CONFIG_SERIAL_8250_FINTEK)	+= 8250_fintek.o
 8250_base-$(CONFIG_SERIAL_8250_PCILIB)	+= 8250_pcilib.o
