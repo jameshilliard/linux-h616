@@ -797,6 +797,7 @@ static void omap_8250_shutdown(struct uart_port *port)
 	if (up->lcr & UART_LCR_SBC)
 		serial_out(up, UART_LCR, up->lcr & ~UART_LCR_SBC);
 	serial_out(up, UART_FCR, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT);
+	serial8250_rpm_put_tx(up);
 }
 
 static void omap_8250_throttle(struct uart_port *port)

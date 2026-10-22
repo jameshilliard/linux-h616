@@ -192,6 +192,7 @@ void serial8250_wait_for_xmitr(struct uart_8250_port *up, int bits);
 
 void serial8250_rpm_get(struct uart_8250_port *p);
 void serial8250_rpm_put(struct uart_8250_port *p);
+void serial8250_rpm_put_tx(struct uart_8250_port *p);
 DEFINE_GUARD(serial8250_rpm, struct uart_8250_port *,
 	     serial8250_rpm_get(_T), serial8250_rpm_put(_T));
 

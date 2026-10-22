@@ -672,7 +672,7 @@ static void serial8250_rpm_get_tx(struct uart_8250_port *p)
 	pm_runtime_get_sync(p->port.dev);
 }
 
-static void serial8250_rpm_put_tx(struct uart_8250_port *p)
+void serial8250_rpm_put_tx(struct uart_8250_port *p)
 {
 	unsigned char rpm_active;
 
@@ -684,6 +684,7 @@ static void serial8250_rpm_put_tx(struct uart_8250_port *p)
 		return;
 	pm_runtime_put_autosuspend(p->port.dev);
 }
+EXPORT_SYMBOL_GPL(serial8250_rpm_put_tx);
 
 /*
  * IER sleep support.  UARTs which have EFRs need the "extended
@@ -2488,6 +2489,8 @@ void serial8250_do_shutdown(struct uart_port *port)
 	 */
 	synchronize_irq(port->irq);
 
+	/* TX interrupts can no longer release the transmit reference. */
+	serial8250_rpm_put_tx(up);
 	serial8250_rpm_put(up);
 
 	up->ops->release_irq(up);
