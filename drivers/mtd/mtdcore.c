@@ -1434,6 +1434,8 @@ EXPORT_SYMBOL_GPL(put_mtd_device);
 void __put_mtd_device(struct mtd_info *mtd)
 {
 	struct mtd_info *master = mtd_get_master(mtd);
+	/* master can be freed in _put_device */
+	struct module *owner = master->owner;
 
 	while (mtd) {
 		/* kref_put() can relese mtd, so keep a reference mtd->parent */
@@ -1447,11 +1449,12 @@ void __put_mtd_device(struct mtd_info *mtd)
 	if (IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER))
 		kref_put(&master->refcnt, mtd_device_release);
 
-	module_put(master->owner);
-
-	/* must be the last as master can be freed in the _put_device */
+	/* must be the last use of master */
 	if (master->_put_device)
 		master->_put_device(master);
+
+	/* _put_device() runs code from @owner, so drop the module last */
+	module_put(owner);
 }
 EXPORT_SYMBOL_GPL(__put_mtd_device);
 
