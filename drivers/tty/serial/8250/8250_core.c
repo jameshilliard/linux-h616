@@ -830,10 +830,8 @@ static int __serial8250_register_8250_port(struct uart_8250_port *uart,
 		uart->port.get_divisor = up->port.get_divisor;
 	if (up->port.set_divisor)
 		uart->port.set_divisor = up->port.set_divisor;
-	if (up->port.get_rxtrig)
-		uart->port.get_rxtrig = up->port.get_rxtrig;
-	if (up->port.set_rxtrig)
-		uart->port.set_rxtrig = up->port.set_rxtrig;
+	uart->port.get_rxtrig = up->port.get_rxtrig;
+	uart->port.set_rxtrig = up->port.set_rxtrig;
 	if (up->port.startup)
 		uart->port.startup = up->port.startup;
 	if (up->port.shutdown)
@@ -953,6 +951,9 @@ void serial8250_unregister_port(struct uart_8250_port *uart)
 	}
 
 	uart_remove_one_port(&serial8250_reg, &uart->port);
+	/* The fallback port must use the generic RX trigger handlers. */
+	uart->port.get_rxtrig = NULL;
+	uart->port.set_rxtrig = NULL;
 	if (serial8250_isa_devs) {
 		uart->port.flags &= ~UPF_BOOT_AUTOCONF;
 		uart->port.type = PORT_UNKNOWN;
