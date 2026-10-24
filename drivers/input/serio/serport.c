@@ -18,6 +18,7 @@
 #include <linux/serio.h>
 #include <linux/tty.h>
 #include <linux/compat.h>
+#include <linux/workqueue.h>
 
 MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");
 MODULE_DESCRIPTION("Input device TTY line discipline");
@@ -33,6 +34,7 @@ struct serport {
 	wait_queue_head_t wait;
 	struct serio *serio;
 	struct serio_device_id id;
+	struct work_struct write_wakeup;
 	spinlock_t lock;
 	unsigned long flags;
 };
@@ -66,6 +68,16 @@ static void serport_serio_close(struct serio *serio)
 	clear_bit(SERPORT_ACTIVE, &serport->flags);
 }
 
+static void serport_write_wakeup(struct work_struct *work)
+{
+	struct serport *serport = container_of(work, struct serport, write_wakeup);
+
+	guard(spinlock_irqsave)(&serport->lock);
+
+	if (test_bit(SERPORT_ACTIVE, &serport->flags))
+		serio_drv_write_wakeup(serport->serio);
+}
+
 /*
  * serport_ldisc_open() is the routine that is called upon setting our line
  * discipline on a tty. It prepares the serio struct.
@@ -85,6 +97,7 @@ static int serport_ldisc_open(struct tty_struct *tty)
 	serport->tty = tty;
 	spin_lock_init(&serport->lock);
 	init_waitqueue_head(&serport->wait);
+	INIT_WORK(&serport->write_wakeup, serport_write_wakeup);
 
 	tty->disc_data = serport;
 	tty->receive_room = 256;
@@ -101,6 +114,7 @@ static void serport_ldisc_close(struct tty_struct *tty)
 {
 	struct serport *serport = tty->disc_data;
 
+	cancel_work_sync(&serport->write_wakeup);
 	kfree(serport);
 }
 
@@ -249,10 +263,8 @@ static void serport_ldisc_write_wakeup(struct tty_struct * tty)
 {
 	struct serport *serport = tty->disc_data;
 
-	guard(spinlock_irqsave)(&serport->lock);
-
-	if (test_bit(SERPORT_ACTIVE, &serport->flags))
-		serio_drv_write_wakeup(serport->serio);
+	/* A serio driver may write to the TTY, so defer the callback. */
+	schedule_work(&serport->write_wakeup);
 }
 
 /*
