@@ -254,6 +254,8 @@ static inline void dz_transmit_chars(struct dz_mux *mux)
 
 	status = dz_in(dport, DZ_CSR);
 	dport = &mux->dport[LINE(status)];
+	guard(uart_port_lock_irqsave)(&dport->port);
+
 	tport = &dport->port.state->port;
 
 	if (dport->port.x_char) {		/* XON/XOFF chars */
@@ -265,9 +267,7 @@ static inline void dz_transmit_chars(struct dz_mux *mux)
 	/* If nothing to do or stopped or hardware stopped. */
 	if (uart_tx_stopped(&dport->port) ||
 			!uart_fifo_get(&dport->port, &tmp)) {
-		uart_port_lock(&dport->port);
 		dz_stop_tx(&dport->port);
-		uart_port_unlock(&dport->port);
 		return;
 	}
 
@@ -281,11 +281,8 @@ static inline void dz_transmit_chars(struct dz_mux *mux)
 		uart_write_wakeup(&dport->port);
 
 	/* Are we are done. */
-	if (kfifo_is_empty(&tport->xmit_fifo)) {
-		uart_port_lock(&dport->port);
+	if (kfifo_is_empty(&tport->xmit_fifo))
 		dz_stop_tx(&dport->port);
-		uart_port_unlock(&dport->port);
-	}
 }
 
 /*

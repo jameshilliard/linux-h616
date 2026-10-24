@@ -14,6 +14,8 @@
 
 #ifdef __KERNEL__
 
+#include <linux/workqueue.h>
+
 #define ZS_NUM_REGS 16
 
 /*
@@ -22,6 +24,7 @@
 struct zs_port {
 	struct zs_scc	*scc;			/* Containing SCC.  */
 	struct uart_port port;			/* Underlying UART.  */
+	struct work_struct tx_work;		/* Restart after console output. */
 
 	int		clk_mode;		/* May be 1, 16, 32, or 64.  */
 

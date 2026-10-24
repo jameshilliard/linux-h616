@@ -153,11 +153,12 @@ lqasc_start_tx(struct uart_port *port)
 	struct ltq_uart_port *ltq_port = to_ltq_uart_port(port);
 	u8 ch;
 
+	/* Drop the hardware lock before the helper notifies the line discipline. */
 	spin_lock_irqsave(&ltq_port->lock, flags);
-	uart_port_tx(port, ch,
-		lqasc_tx_ready(port),
-		writeb(ch, port->membase + LTQ_ASC_TBUF));
-	spin_unlock_irqrestore(&ltq_port->lock, flags);
+	uart_port_tx_limited(port, ch, port->fifosize,
+			     lqasc_tx_ready(port),
+			     writeb(ch, port->membase + LTQ_ASC_TBUF),
+			     spin_unlock_irqrestore(&ltq_port->lock, flags));
 	return;
 }
 
@@ -239,7 +240,8 @@ lqasc_tx_int(int irq, void *_port)
 	spin_lock_irqsave(&ltq_port->lock, flags);
 	__raw_writel(ASC_IRNCR_TIR, port->membase + LTQ_ASC_IRNCR);
 	spin_unlock_irqrestore(&ltq_port->lock, flags);
-	lqasc_start_tx(port);
+	scoped_guard(uart_port_lock_irqsave, port)
+		lqasc_start_tx(port);
 	return IRQ_HANDLED;
 }
 

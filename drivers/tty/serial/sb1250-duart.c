@@ -387,6 +387,9 @@ static void sbd_transmit_chars(struct sbd_port *sport)
 	unsigned int mask;
 	int stop_tx;
 
+	/* Serialize FIFO consumption and interrupt masking with start_tx(). */
+	guard(uart_port_lock_irqsave)(uport);
+
 	/* XON/XOFF chars.  */
 	if (sport->port.x_char) {
 		write_sbdchn(sport, R_DUART_TX_HOLD, sport->port.x_char);
@@ -424,15 +427,19 @@ static void sbd_status_handle(struct sbd_port *sport)
 	delta = read_sbdshr(sport, R_DUART_INCHREG((uport->line) % 2));
 	delta >>= (uport->line) % 2;
 
-	if (delta & (M_DUART_IN_PIN0_VAL << S_DUART_IN_PIN_CHNG))
-		uart_handle_cts_change(uport, !(delta & M_DUART_IN_PIN0_VAL));
+	if (!(delta & ((M_DUART_IN_PIN2_VAL | M_DUART_IN_PIN0_VAL) <<
+		       S_DUART_IN_PIN_CHNG)))
+		return;
 
-	if (delta & (M_DUART_IN_PIN2_VAL << S_DUART_IN_PIN_CHNG))
-		uport->icount.dsr++;
+	scoped_guard(uart_port_lock_irqsave, uport) {
+		if (delta & (M_DUART_IN_PIN0_VAL << S_DUART_IN_PIN_CHNG))
+			uart_handle_cts_change(uport, !(delta & M_DUART_IN_PIN0_VAL));
 
-	if (delta & ((M_DUART_IN_PIN2_VAL | M_DUART_IN_PIN0_VAL) <<
-		     S_DUART_IN_PIN_CHNG))
-		wake_up_interruptible(&uport->state->port.delta_msr_wait);
+		if (delta & (M_DUART_IN_PIN2_VAL << S_DUART_IN_PIN_CHNG))
+			uport->icount.dsr++;
+	}
+
+	wake_up_interruptible(&uport->state->port.delta_msr_wait);
 }
 
 static irqreturn_t sbd_interrupt(int irq, void *dev_id)
@@ -611,7 +618,7 @@ static void sbd_set_termios(struct uart_port *uport, struct ktermios *termios,
 	else
 		aux &= ~M_DUART_CTS_CHNG_ENA;
 
-	uart_port_lock(uport);
+	guard(uart_port_lock_irqsave)(uport);
 
 	if (sport->tx_stopped)
 		command |= M_DUART_TX_DIS;
@@ -632,8 +639,6 @@ static void sbd_set_termios(struct uart_port *uport, struct ktermios *termios,
 	write_sbdchn(sport, R_DUART_AUXCTL_X, aux | oldaux);
 
 	write_sbdchn(sport, R_DUART_CMD, command);
-
-	uart_port_unlock(uport);
 }
 
 

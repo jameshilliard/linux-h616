@@ -431,20 +431,23 @@ static void zs_stop_tx(struct uart_port *uport)
 	spin_unlock(&scc->zlock);
 }
 
-static void zs_raw_transmit_chars(struct zs_port *);
+static bool zs_raw_transmit_chars(struct zs_port *);
 
 static void zs_start_tx(struct uart_port *uport)
 {
 	struct zs_port *zport = to_zport(uport);
 	struct zs_scc *scc = zport->scc;
+	bool wakeup = false;
 
 	spin_lock(&scc->zlock);
 	if (zport->tx_stopped) {
 		zs_transmit_drain(zport, 0);
 		zport->tx_stopped = 0;
-		zs_raw_transmit_chars(zport);
+		wakeup = zs_raw_transmit_chars(zport);
 	}
 	spin_unlock(&scc->zlock);
+	if (wakeup)
+		uart_write_wakeup(uport);
 }
 
 static void zs_stop_rx(struct uart_port *uport)
@@ -603,51 +606,81 @@ static void zs_receive_chars(struct zs_port *zport)
 	tty_flip_buffer_push(&uport->state->port);
 }
 
-static void zs_raw_transmit_chars(struct zs_port *zport)
+static bool zs_raw_transmit_chars(struct zs_port *zport)
 {
 	struct tty_port *tport = &zport->port.state->port;
 	unsigned char ch;
+	bool wakeup;
+
+	/* A deferred console restart can race a pending TX interrupt. */
+	if (!(read_zsreg(zport, R0) & Tx_BUF_EMP))
+		return false;
 
 	/* XON/XOFF chars.  */
 	if (zport->port.x_char) {
 		write_zsdata(zport, zport->port.x_char);
 		zport->port.icount.tx++;
 		zport->port.x_char = 0;
-		return;
+		return false;
 	}
 
 	/* If nothing to do or stopped or hardware stopped.  */
 	if (uart_tx_stopped(&zport->port) ||
 			!uart_fifo_get(&zport->port, &ch)) {
 		zs_raw_stop_tx(zport);
-		return;
+		return false;
 	}
 
 	/* Send char.  */
 	write_zsdata(zport, ch);
 
-	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
-		uart_write_wakeup(&zport->port);
+	wakeup = kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS;
 
 	/* Are we are done?  */
 	if (kfifo_is_empty(&tport->xmit_fifo))
 		zs_raw_stop_tx(zport);
+
+	return wakeup;
 }
 
 static void zs_transmit_chars(struct zs_port *zport)
 {
 	struct zs_scc *scc = zport->scc;
+	bool wakeup;
+
+	guard(uart_port_lock_irqsave)(&zport->port);
 
 	spin_lock(&scc->zlock);
-	zs_raw_transmit_chars(zport);
+	wakeup = zs_raw_transmit_chars(zport);
 	spin_unlock(&scc->zlock);
+	if (wakeup)
+		uart_write_wakeup(&zport->port);
+}
+
+static void zs_tx_work(struct work_struct *work)
+{
+	struct zs_port *zport = container_of(work, struct zs_port, tx_work);
+	struct uart_port *uport = &zport->port;
+	bool wakeup = false;
+
+	guard(uart_port_lock_irqsave)(uport);
+
+	if (!uport->state || !uport->state->port.xmit_buf)
+		return;
+
+	scoped_guard(spinlock, &zport->scc->zlock) {
+		if (!zport->tx_stopped)
+			wakeup = zs_raw_transmit_chars(zport);
+	}
+	if (wakeup)
+		uart_write_wakeup(uport);
 }
 
 static void zs_status_handle(struct zs_port *zport, struct zs_port *zport_a)
 {
 	struct uart_port *uport = &zport->port;
 	struct zs_scc *scc = zport->scc;
-	unsigned int delta;
+	unsigned int delta, mctrl;
 	u8 status, brk;
 
 	spin_lock(&scc->zlock);
@@ -670,18 +703,19 @@ static void zs_status_handle(struct zs_port *zport, struct zs_port *zport_a)
 
 	if (zport != zport_a) {
 		delta = zs_raw_xor_mctrl(zport);
+		mctrl = zport->mctrl;
 		spin_unlock(&scc->zlock);
 
-		if (delta & TIOCM_CTS)
-			uart_handle_cts_change(uport,
-					       zport->mctrl & TIOCM_CTS);
-		if (delta & TIOCM_CAR)
-			uart_handle_dcd_change(uport,
-					       zport->mctrl & TIOCM_CAR);
-		if (delta & TIOCM_RNG)
-			uport->icount.rng++;
-		if (delta & TIOCM_DSR)
-			uport->icount.dsr++;
+		scoped_guard(uart_port_lock_irqsave, uport) {
+			if (delta & TIOCM_CTS)
+				uart_handle_cts_change(uport, mctrl & TIOCM_CTS);
+			if (delta & TIOCM_CAR)
+				uart_handle_dcd_change(uport, mctrl & TIOCM_CAR);
+			if (delta & TIOCM_RNG)
+				uport->icount.rng++;
+			if (delta & TIOCM_DSR)
+				uport->icount.dsr++;
+		}
 
 		if (delta)
 			wake_up_interruptible(&uport->state->port.delta_msr_wait);
@@ -809,13 +843,19 @@ static void zs_shutdown(struct uart_port *uport)
 	unsigned long flags;
 	int irq_guard;
 
-	spin_lock_irqsave(&scc->zlock, flags);
+	uart_port_lock_irqsave(uport, &flags);
+	spin_lock(&scc->zlock);
+	zs_raw_stop_tx(zport);
+	zport->regs[1] &= ~TxINT_ENAB;
+	write_zsreg(zport, R1, zport->regs[1]);
 
 	zport->regs[3] &= ~RxENABLE;
 	write_zsreg(zport, R5, zport->regs[5]);
 	write_zsreg(zport, R3, zport->regs[3]);
 
-	spin_unlock_irqrestore(&scc->zlock, flags);
+	spin_unlock(&scc->zlock);
+	uart_port_unlock_irqrestore(uport, flags);
+	cancel_work_sync(&zport->tx_work);
 
 	irq_guard = atomic_add_return(-1, &scc->irq_guard);
 	if (!irq_guard)
@@ -1066,6 +1106,7 @@ static int __init zs_probe(struct platform_device *pdev)
 
 		zport->scc	= &zs_sccs[chip];
 		zport->clk_mode	= 16;
+		INIT_WORK(&zport->tx_work, zs_tx_work);
 
 		uport->dev	= &pdev->dev;
 		uport->has_sysrq = IS_ENABLED(CONFIG_SERIAL_ZS_CONSOLE);
@@ -1098,8 +1139,10 @@ static void __exit zs_remove(struct platform_device *pdev)
 		struct zs_port *zport = &zs_sccs[chip].zport[side];
 		struct uart_port *uport = &zport->port;
 
-		if (uport->dev)
+		if (uport->dev) {
 			uart_remove_one_port(&zs_reg, uport);
+			cancel_work_sync(&zport->tx_work);
+		}
 	}
 }
 
@@ -1161,9 +1204,12 @@ static void zs_console_write(struct console *co, const char *s,
 		zport->regs[1] |= TxINT_ENAB;
 		write_zsreg(zport, R1, zport->regs[1]);
 
-		/* Resume any transmission as the TxIP bit won't be set.  */
+		/*
+		 * TxIP won't be set. Defer the restart: console output may be
+		 * called with the port lock held, and TX must acquire it first.
+		 */
 		if (!zport->tx_stopped)
-			zs_raw_transmit_chars(zport);
+			schedule_work(&zport->tx_work);
 	}
 	spin_unlock_irqrestore(&scc->zlock, flags);
 }
