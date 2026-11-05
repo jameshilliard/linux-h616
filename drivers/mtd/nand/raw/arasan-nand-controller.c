@@ -1315,7 +1315,7 @@ static int anfc_chip_init(struct arasan_nfc *nfc, struct device_node *np)
 
 	chip = &anand->chip;
 	mtd = nand_to_mtd(chip);
-	mtd->dev.parent = nfc->dev;
+	mtd->parent_dev = nfc->dev;
 	chip->controller = &nfc->controller;
 	chip->options = NAND_BUSWIDTH_AUTO | NAND_NO_SUBPAGE_WRITE |
 			NAND_USES_DMA;

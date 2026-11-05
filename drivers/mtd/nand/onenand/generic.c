@@ -60,7 +60,7 @@ static int generic_onenand_probe(struct platform_device *pdev)
 
 	info->onenand.irq = err;
 
-	info->mtd.dev.parent = &pdev->dev;
+	info->mtd.parent_dev = &pdev->dev;
 	info->mtd.priv = &info->onenand;
 
 	if (onenand_scan(&info->mtd, 1)) {

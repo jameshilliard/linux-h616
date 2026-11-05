@@ -394,7 +394,7 @@ static int ingenic_nand_init_chip(struct platform_device *pdev,
 				   cs->bank);
 	if (!mtd->name)
 		return -ENOMEM;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	chip->options = NAND_NO_SUBPAGE_WRITE;
 	chip->ecc.engine_type = NAND_ECC_ENGINE_TYPE_ON_HOST;

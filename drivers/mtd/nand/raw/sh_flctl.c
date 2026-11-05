@@ -1153,7 +1153,7 @@ static int flctl_probe(struct platform_device *pdev)
 	nand = &flctl->chip;
 	flctl_mtd = nand_to_mtd(nand);
 	nand_set_flash_node(nand, pdev->dev.of_node);
-	flctl_mtd->dev.parent = &pdev->dev;
+	flctl_mtd->parent_dev = &pdev->dev;
 	flctl->pdev = pdev;
 	flctl->hwecc = pdata->has_hwecc;
 	flctl->holden = pdata->use_holden;

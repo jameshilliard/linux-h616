@@ -328,7 +328,7 @@ static int lpc32xx_waitfunc_nand(struct nand_chip *chip)
 
 	while (!(readb(MLC_ISR(host->io_base)) & MLCISR_NAND_READY)) {
 		/* Seems to be delayed sometimes by controller */
-		dev_dbg(&mtd->dev, "Warning: NAND not ready.\n");
+		dev_dbg(mtd->dev, "Warning: NAND not ready.\n");
 		cpu_relax();
 	}
 
@@ -348,7 +348,7 @@ static int lpc32xx_waitfunc_controller(struct nand_chip *chip)
 
 	while (!(readb(MLC_ISR(host->io_base)) &
 		 MLCISR_CONTROLLER_READY)) {
-		dev_dbg(&mtd->dev, "Warning: Controller not ready.\n");
+		dev_dbg(mtd->dev, "Warning: Controller not ready.\n");
 		cpu_relax();
 	}
 
@@ -402,13 +402,13 @@ static int lpc32xx_xmit_dma(struct mtd_info *mtd, void *mem, int len,
 	res = dma_map_sg(host->dma_chan->device->dev, &host->sgl, 1,
 			 DMA_BIDIRECTIONAL);
 	if (res != 1) {
-		dev_err(mtd->dev.parent, "Failed to map sg list\n");
+		dev_err(mtd->parent_dev, "Failed to map sg list\n");
 		return -ENXIO;
 	}
 	desc = dmaengine_prep_slave_sg(host->dma_chan, &host->sgl, 1, dir,
 				       flags);
 	if (!desc) {
-		dev_err(mtd->dev.parent, "Failed to prepare slave sg\n");
+		dev_err(mtd->parent_dev, "Failed to prepare slave sg\n");
 		res = -ENXIO;
 		goto out1;
 	}
@@ -472,7 +472,7 @@ static int lpc32xx_read_page(struct nand_chip *chip, uint8_t *buf,
 		mlc_isr = readl(MLC_ISR(host->io_base));
 		if (mlc_isr & MLCISR_DECODER_FAILURE) {
 			mtd->ecc_stats.failed++;
-			dev_warn(&mtd->dev, "%s: DECODER_FAILURE\n", __func__);
+			dev_warn(mtd->dev, "%s: DECODER_FAILURE\n", __func__);
 		} else if (mlc_isr & MLCISR_ERRORS_DETECTED) {
 			mtd->ecc_stats.corrected += ((mlc_isr >> 4) & 0x3) + 1;
 		}
@@ -579,9 +579,9 @@ static int lpc32xx_dma_setup(struct lpc32xx_nand_host *host)
 {
 	struct mtd_info *mtd = nand_to_mtd(&host->nand_chip);
 
-	host->dma_chan = dma_request_chan(mtd->dev.parent, "rx-tx");
+	host->dma_chan = dma_request_chan(mtd->parent_dev, "rx-tx");
 	if (IS_ERR(host->dma_chan)) {
-		dev_err(mtd->dev.parent, "Failed to request DMA channel\n");
+		dev_err(mtd->parent_dev, "Failed to request DMA channel\n");
 		return PTR_ERR(host->dma_chan);
 	}
 
@@ -600,7 +600,7 @@ static int lpc32xx_dma_setup(struct lpc32xx_nand_host *host)
 	host->dma_slave_config.src_addr = MLC_BUFF(host->io_base_phy);
 	host->dma_slave_config.dst_addr = MLC_BUFF(host->io_base_phy);
 	if (dmaengine_slave_config(host->dma_chan, &host->dma_slave_config)) {
-		dev_err(mtd->dev.parent, "Failed to setup DMA slave\n");
+		dev_err(mtd->parent_dev, "Failed to setup DMA slave\n");
 		goto out1;
 	}
 
@@ -724,7 +724,7 @@ static int lpc32xx_nand_probe(struct platform_device *pdev)
 	/* link the private data structures */
 	nand_set_controller_data(nand_chip, host);
 	nand_set_flash_node(nand_chip, pdev->dev.of_node);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	/* Get NAND clock */
 	host->clk = clk_get(&pdev->dev, NULL);

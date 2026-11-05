@@ -1428,7 +1428,7 @@ meson_nfc_nand_chip_init(struct device *dev,
 	nand->options |= NAND_USES_DMA;
 	mtd = nand_to_mtd(nand);
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	ret = of_property_read_u32(np, "nand-rb", &nand_rb_val);
 	if (ret == -EINVAL)

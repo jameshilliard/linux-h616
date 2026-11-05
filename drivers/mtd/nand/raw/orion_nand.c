@@ -148,7 +148,7 @@ static int __init orion_nand_probe(struct platform_device *pdev)
 		board = dev_get_platdata(&pdev->dev);
 	}
 
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	nand_set_controller_data(nc, board);
 	nand_set_flash_node(nc, pdev->dev.of_node);

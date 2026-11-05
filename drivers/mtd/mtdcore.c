@@ -37,37 +37,9 @@
 #include <linux/mtd/concat.h>
 
 #include "mtdcore.h"
+#include "mtddevice.h"
 
 struct backing_dev_info *mtd_bdi;
-
-#ifdef CONFIG_PM_SLEEP
-
-static int mtd_cls_suspend(struct device *dev)
-{
-	struct mtd_info *mtd = dev_get_drvdata(dev);
-
-	return mtd ? mtd_suspend(mtd) : 0;
-}
-
-static int mtd_cls_resume(struct device *dev)
-{
-	struct mtd_info *mtd = dev_get_drvdata(dev);
-
-	if (mtd)
-		mtd_resume(mtd);
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(mtd_cls_pm_ops, mtd_cls_suspend, mtd_cls_resume);
-#define MTD_CLS_PM_OPS (&mtd_cls_pm_ops)
-#else
-#define MTD_CLS_PM_OPS NULL
-#endif
-
-static struct class mtd_class = {
-	.name = "mtd",
-	.pm = MTD_CLS_PM_OPS,
-};
 
 static DEFINE_IDR(mtd_idr);
 
@@ -78,7 +50,15 @@ EXPORT_SYMBOL_GPL(mtd_table_mutex);
 
 struct mtd_info *__mtd_next_device(int i)
 {
-	return idr_get_next(&mtd_idr, &i);
+	struct mtd_info *mtd;
+
+	while ((mtd = idr_get_next(&mtd_idr, &i))) {
+		if (mtd->registered)
+			return mtd;
+		i++;
+	}
+
+	return NULL;
 }
 EXPORT_SYMBOL_GPL(__mtd_next_device);
 
@@ -87,54 +67,117 @@ static LIST_HEAD(mtd_notifiers);
 
 #define MTD_DEVT(index) MKDEV(MTD_CHAR_MAJOR, (index)*2)
 
-/* REVISIT once MTD uses the driver model better, whoever allocates
- * the mtd_info will probably want to use the release() hook...
- */
-static void mtd_release(struct device *dev)
+static void mtd_master_release(struct kref *ref)
 {
-	struct mtd_info *mtd = dev_get_drvdata(dev);
-	dev_t index = MTD_DEVT(mtd->index);
+	struct mtd_info *master = container_of(ref, struct mtd_info,
+					     master.life_refcnt);
 
-	idr_remove(&mtd_idr, mtd->index);
+	master->master.release(master);
+}
+
+void mtd_get_lifetime(struct mtd_info *master)
+{
+	if (master->master.release)
+		kref_get(&master->master.life_refcnt);
+}
+
+void mtd_put_lifetime(struct mtd_info *master)
+{
+	if (master->master.release)
+		kref_put(&master->master.life_refcnt, mtd_master_release);
+}
+
+/**
+ * mtd_set_release - initialize the lifetime of a dynamically allocated master
+ * @master: master MTD device
+ * @release: core callback freeing the backing object and retained metadata
+ *
+ * Call once before registration. The driver owns the initial reference and
+ * drops it with mtd_put_master() after unregistering and disconnecting hardware.
+ * Registered MTD devices and acquired handles retain the backing object too.
+ * Driver cleanup must finish before the initial reference is dropped. The
+ * release callback only frees data and belongs to the core providing the MTD
+ * operations, identified by master->owner, not to the controller driver.
+ */
+void mtd_set_release(struct mtd_info *master,
+		     void (*release)(struct mtd_info *mtd))
+{
+	kref_init(&master->master.life_refcnt);
+	master->master.release = release;
+}
+EXPORT_SYMBOL_GPL(mtd_set_release);
+
+/**
+ * mtd_put_master - drop the driver's initial lifetime reference
+ * @master: master initialized by mtd_set_release()
+ *
+ * Hardware access and driver callbacks must already be disconnected and
+ * drained. Unbind may return while handles retain core-owned metadata.
+ */
+void mtd_put_master(struct mtd_info *master)
+{
+	mtd_put_lifetime(master);
+}
+EXPORT_SYMBOL_GPL(mtd_put_master);
+
+static void mtd_data_release(struct kref *ref)
+{
+	struct mtd_info *mtd = container_of(ref, struct mtd_info, data_refcnt);
+	struct mtd_info *master = mtd->ref_master;
+	struct mtd_info *parent = mtd->parent;
+	struct device *dev = mtd->dev;
+
 	of_node_put(mtd_get_of_node(mtd));
+	mtd->dev = NULL;
+	mtd->ref_master = NULL;
 
 	if (mtd_is_partition(mtd))
 		release_mtd_partition(mtd);
 
-	/* remove /dev/mtdXro node */
-	device_destroy(&mtd_class, index + 1);
+	if (master) {
+		if (parent && parent != master)
+			mtd_put_data(parent);
+		mtd_put_lifetime(master);
+	}
+	put_device(dev);
+	module_put(THIS_MODULE);
 }
 
-/*
- * No-op device release used in add_mtd_device() error paths.
- * Prevents mtd_release() from being called via device_release(),
- * which would free the mtd_info that the caller still manages.
- */
-static void mtd_dev_release_nop(struct device *dev)
+void mtd_get_data(struct mtd_info *mtd)
 {
+	kref_get(&mtd->data_refcnt);
+}
+
+void mtd_put_data(struct mtd_info *mtd)
+{
+	kref_put(&mtd->data_refcnt, mtd_data_release);
+}
+
+static void mtd_device_detach(struct device *dev)
+{
+	/* A queued system-sleep callback may run after device_del(). */
+	guard(device)(dev);
+
+	dev_set_drvdata(dev, NULL);
+	dev->groups = NULL;
 }
 
 static void mtd_device_release(struct kref *kref)
 {
 	struct mtd_info *mtd = container_of(kref, struct mtd_info, refcnt);
-	bool is_partition = mtd_is_partition(mtd);
+
+	/* The table mutex is held by the registration or handle put path. */
+	idr_remove(&mtd_idr, mtd->index);
+	device_destroy(&mtd_class, MTD_DEVT(mtd->index) + 1);
 
 	debugfs_remove_recursive(mtd->dbg.dfs_dir);
 
 	/* Try to remove the NVMEM provider */
 	nvmem_unregister(mtd->nvmem);
 
-	device_unregister(&mtd->dev);
-
-	/*
-	 *  Clear dev so mtd can be safely re-registered later if desired.
-	 *  Should not be done for partition,
-	 *  as it was already destroyed in device_unregister().
-	 */
-	if (!is_partition)
-		memset(&mtd->dev, 0, sizeof(mtd->dev));
-
-	module_put(THIS_MODULE);
+	device_del(mtd->dev);
+	mtd_device_detach(mtd->dev);
+	mtd_put_data(mtd);
 }
 
 #define MTD_DEVICE_ATTR_RO(name) \
@@ -371,12 +414,6 @@ static struct attribute *mtd_attrs[] = {
 };
 ATTRIBUTE_GROUPS(mtd);
 
-static const struct device_type mtd_devtype = {
-	.name		= "mtd",
-	.groups		= mtd_groups,
-	.release	= mtd_release,
-};
-
 static bool mtd_expert_analysis_mode;
 
 #ifdef CONFIG_DEBUG_FS
@@ -434,7 +471,7 @@ DEFINE_SHOW_ATTRIBUTE(mtd_ooblayout_free);
 
 static void mtd_debugfs_populate(struct mtd_info *mtd)
 {
-	struct device *dev = &mtd->dev;
+	struct device *dev = mtd->dev;
 	struct mtd_oob_region region;
 
 	if (IS_ERR_OR_NULL(dfs_dir_mtd))
@@ -610,9 +647,9 @@ static int mtd_nvmem_add(struct mtd_info *mtd)
 	struct nvmem_config config = {};
 
 	config.id = NVMEM_DEVID_NONE;
-	config.dev = &mtd->dev;
-	config.name = dev_name(&mtd->dev);
-	config.owner = THIS_MODULE;
+	config.dev = mtd->dev;
+	config.name = dev_name(mtd->dev);
+	config.owner = mtd_get_master(mtd)->owner;
 	config.add_legacy_fixed_of_cells = of_device_is_compatible(node, "nvmem-cells");
 	config.reg_read = mtd_nvmem_reg_read;
 	config.size = mtd->size;
@@ -629,7 +666,7 @@ static int mtd_nvmem_add(struct mtd_info *mtd)
 		if (PTR_ERR(mtd->nvmem) == -EOPNOTSUPP)
 			mtd->nvmem = NULL;
 		else
-			return dev_err_probe(&mtd->dev, PTR_ERR(mtd->nvmem),
+			return dev_err_probe(mtd->dev, PTR_ERR(mtd->nvmem),
 					     "Failed to register NVMEM device\n");
 	}
 
@@ -703,6 +740,7 @@ int add_mtd_device(struct mtd_info *mtd)
 	struct device_node *np = mtd_get_of_node(mtd);
 	struct mtd_info *master = mtd_get_master(mtd);
 	struct mtd_notifier *not;
+	struct device *dev;
 	int i, error, ofidx;
 
 	/*
@@ -710,7 +748,7 @@ int add_mtd_device(struct mtd_info *mtd)
 	 * mtd_device_parse_register() multiple times on the same master MTD,
 	 * especially with CONFIG_MTD_PARTITIONED_MASTER=y.
 	 */
-	if (WARN_ONCE(mtd->dev.type, "MTD already registered\n"))
+	if (WARN_ONCE(mtd->dev, "MTD already registered\n"))
 		return -EEXIST;
 
 	BUG_ON(mtd->writesize == 0);
@@ -756,6 +794,13 @@ int add_mtd_device(struct mtd_info *mtd)
 
 	mtd->index = i;
 	kref_init(&mtd->refcnt);
+	kref_init(&mtd->data_refcnt);
+	if (master->master.release) {
+		mtd_get_lifetime(master);
+		mtd->ref_master = master;
+		if (mtd->parent && mtd->parent != master)
+			mtd_get_data(mtd->parent);
+	}
 
 	/* default value if not set by driver */
 	if (mtd->bitflip_threshold == 0)
@@ -793,18 +838,21 @@ int add_mtd_device(struct mtd_info *mtd)
 		error = 0;
 	}
 
-	/* Caller should have set dev.parent to match the
-	 * physical device, if appropriate.
-	 */
-	mtd->dev.type = &mtd_devtype;
-	mtd->dev.class = &mtd_class;
-	mtd->dev.devt = MTD_DEVT(i);
-	error = dev_set_name(&mtd->dev, "mtd%d", i);
-	if (error)
-		goto fail_devname;
-	dev_set_drvdata(&mtd->dev, mtd);
 	mtd_set_of_node(mtd, mtd_find_of_node(mtd));
-	error = device_register(&mtd->dev);
+	dev = mtd_class_device_alloc(mtd_get_of_node(mtd));
+	if (!dev) {
+		error = -ENOMEM;
+		goto fail_alloc;
+	}
+	mtd->dev = dev;
+	dev->parent = mtd->parent_dev;
+	dev->groups = mtd_groups;
+	dev->devt = MTD_DEVT(i);
+	dev_set_drvdata(dev, mtd);
+	error = dev_set_name(dev, "mtd%d", i);
+	if (error)
+		goto fail_added;
+	error = device_add(dev);
 	if (error)
 		goto fail_added;
 
@@ -815,10 +863,12 @@ int add_mtd_device(struct mtd_info *mtd)
 
 	mtd_debugfs_populate(mtd);
 
-	device_create(&mtd_class, mtd->dev.parent, MTD_DEVT(i) + 1, NULL,
+	device_create(&mtd_class, mtd->parent_dev, MTD_DEVT(i) + 1, NULL,
 		      "mtd%dro", i);
 
 	pr_debug("mtd: Giving out device %d to %s\n", i, mtd->name);
+	__module_get(THIS_MODULE);
+	mtd->registered = true;
 	/* No need to get a refcount on the module containing
 	   the notifier, since we hold the mtd_table_mutex */
 	list_for_each_entry(not, &mtd_notifiers, list)
@@ -836,27 +886,24 @@ int add_mtd_device(struct mtd_info *mtd)
 		}
 	}
 
-	/* We _know_ we aren't being removed, because
-	   our caller is still holding us here. So none
-	   of this try_ nonsense, and no bitching about it
-	   either. :) */
-	__module_get(THIS_MODULE);
 	return 0;
 
 fail_nvmem_add:
-	device_del(&mtd->dev);
+	device_del(dev);
 fail_added:
-	/*
-	 * Clear type and set nop release to prevent mtd_release() ->
-	 * release_mtd_partition() -> free_partition() from freeing mtd.
-	 * The caller handles cleanup on failure.
-	 */
-	mtd->dev.type = NULL;
-	mtd->dev.release = mtd_dev_release_nop;
-	put_device(&mtd->dev);
+	mtd_device_detach(dev);
+	put_device(dev);
+	mtd->dev = NULL;
+fail_alloc:
 	of_node_put(mtd_get_of_node(mtd));
-fail_devname:
+	mtd_set_of_node(mtd, np);
 	idr_remove(&mtd_idr, i);
+	if (mtd->ref_master) {
+		mtd->ref_master = NULL;
+		if (mtd->parent && mtd->parent != master)
+			mtd_put_data(mtd->parent);
+		mtd_put_lifetime(master);
+	}
 fail_locked:
 	mutex_unlock(&mtd_table_mutex);
 	return error;
@@ -879,7 +926,7 @@ int del_mtd_device(struct mtd_info *mtd)
 
 	mutex_lock(&mtd_table_mutex);
 
-	if (idr_find(&mtd_idr, mtd->index) != mtd) {
+	if (idr_find(&mtd_idr, mtd->index) != mtd || !mtd->registered) {
 		ret = -ENODEV;
 		goto out_error;
 	}
@@ -889,6 +936,7 @@ int del_mtd_device(struct mtd_info *mtd)
 	list_for_each_entry(not, &mtd_notifiers, list)
 		not->remove(mtd);
 
+	mtd->registered = false;
 	kref_put(&mtd->refcnt, mtd_device_release);
 	ret = 0;
 
@@ -901,13 +949,13 @@ out_error:
  * Set a few defaults based on the parent devices, if not provided by the
  * driver
  */
-static void mtd_set_dev_defaults(struct mtd_info *mtd)
+void mtd_set_dev_defaults(struct mtd_info *mtd)
 {
-	if (mtd->dev.parent) {
-		if (!mtd->owner && mtd->dev.parent->driver)
-			mtd->owner = mtd->dev.parent->driver->owner;
+	if (mtd->parent_dev) {
+		if (!mtd->master.release && !mtd->owner && mtd->parent_dev->driver)
+			mtd->owner = mtd->parent_dev->driver->owner;
 		if (!mtd->name)
-			mtd->name = dev_name(mtd->dev.parent);
+			mtd->name = dev_name(mtd->parent_dev);
 	} else {
 		pr_debug("mtd device won't show a device symlink in sysfs\n");
 	}
@@ -960,13 +1008,13 @@ static struct nvmem_device *mtd_otp_nvmem_register(struct mtd_info *mtd,
 	struct device_node *np;
 
 	/* DT binding is optional */
-	np = of_get_compatible_child(mtd->dev.of_node, compatible);
+	np = of_get_compatible_child(mtd_get_of_node(mtd), compatible);
 
 	/* OTP nvmem will be registered on the physical device */
-	config.dev = mtd->dev.parent;
+	config.dev = mtd->parent_dev;
 	config.name = compatible;
 	config.id = NVMEM_DEVID_AUTO;
-	config.owner = THIS_MODULE;
+	config.owner = mtd->owner;
 	config.add_legacy_fixed_of_cells = !mtd_type_is_nand(mtd);
 	config.type = NVMEM_TYPE_OTP;
 	config.root_only = true;
@@ -1016,7 +1064,7 @@ static int mtd_nvmem_fact_otp_reg_read(void *priv, unsigned int offset,
 
 static int mtd_otp_nvmem_add(struct mtd_info *mtd)
 {
-	struct device *dev = mtd->dev.parent;
+	struct device *dev = mtd->parent_dev;
 	struct nvmem_device *nvmem;
 	ssize_t size;
 	int err;
@@ -1150,7 +1198,7 @@ int mtd_device_parse_register(struct mtd_info *mtd, const char * const *types,
 		ret = 0;
 	else if (nr_parts)
 		ret = add_mtd_partitions(mtd, parts, nr_parts);
-	else if (!device_is_registered(&mtd->dev))
+	else if (!mtd->dev || !device_is_registered(mtd->dev))
 		ret = add_mtd_device(mtd);
 	else
 		ret = 0;
@@ -1184,7 +1232,7 @@ out:
 		nvmem_unregister(mtd->otp_factory_nvmem);
 	}
 
-	if (ret && device_is_registered(&mtd->dev)) {
+	if (ret && mtd->dev && device_is_registered(mtd->dev)) {
 		err = del_mtd_device(mtd);
 		if (err)
 			pr_err("Error when deleting MTD device (%d)\n", err);
@@ -1225,7 +1273,7 @@ int mtd_device_unregister(struct mtd_info *master)
 	if (err)
 		return err;
 
-	if (!device_is_registered(&master->dev))
+	if (!master->dev || !device_is_registered(master->dev))
 		return 0;
 
 	return del_mtd_device(master);
@@ -1328,7 +1376,6 @@ out:
 }
 EXPORT_SYMBOL_GPL(get_mtd_device);
 
-
 /**
  * get_mtd_device_by_dev - acquire the MTD associated with a class device
  * @dev: referenced MTD class device
@@ -1342,7 +1389,7 @@ struct mtd_info *get_mtd_device_by_dev(struct device *dev)
 
 	guard(mutex)(&mtd_table_mutex);
 	mtd_for_each_device(mtd) {
-		if (&mtd->dev != dev)
+		if (mtd->dev != dev)
 			continue;
 		err = __get_mtd_device(mtd);
 		return err ? ERR_PTR(err) : mtd;
@@ -1355,7 +1402,11 @@ EXPORT_SYMBOL_GPL(get_mtd_device_by_dev);
 int __get_mtd_device(struct mtd_info *mtd)
 {
 	struct mtd_info *master = mtd_get_master(mtd);
+	bool master_ref = mtd == master || IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER);
 	int err;
+
+	if (!mtd->registered)
+		return -ENODEV;
 
 	if (master->_get_device) {
 		err = master->_get_device(mtd);
@@ -1369,13 +1420,14 @@ int __get_mtd_device(struct mtd_info *mtd)
 		return -ENODEV;
 	}
 
+	mtd_get_lifetime(master);
 	while (mtd) {
 		if (mtd != master)
 			kref_get(&mtd->refcnt);
 		mtd = mtd->parent;
 	}
 
-	if (IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER))
+	if (master_ref)
 		kref_get(&master->refcnt);
 
 	return 0;
@@ -1460,8 +1512,10 @@ EXPORT_SYMBOL_GPL(put_mtd_device);
 void __put_mtd_device(struct mtd_info *mtd)
 {
 	struct mtd_info *master = mtd_get_master(mtd);
+	bool master_ref = mtd == master || IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER);
 	/* master can be freed in _put_device */
 	struct module *owner = master->owner;
+	bool managed = master->master.release;
 
 	while (mtd) {
 		/* kref_put() can relese mtd, so keep a reference mtd->parent */
@@ -1472,12 +1526,14 @@ void __put_mtd_device(struct mtd_info *mtd)
 		mtd = parent;
 	}
 
-	if (IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER))
+	if (master_ref)
 		kref_put(&master->refcnt, mtd_device_release);
 
-	/* must be the last use of master */
+	/* Legacy _put_device() callbacks can free an unmanaged master. */
 	if (master->_put_device)
 		master->_put_device(master);
+	if (managed)
+		mtd_put_lifetime(master);
 
 	/* _put_device() runs code from @owner, so drop the module last */
 	module_put(owner);

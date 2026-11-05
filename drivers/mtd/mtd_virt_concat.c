@@ -100,7 +100,7 @@ int mtd_virt_concat_destroy(struct mtd_info *mtd)
 
 		/* Find the concat item that hold the mtd device */
 		for (idx = 0; idx < item->count; idx++) {
-			if (item->nodes[idx] == mtd->dev.of_node) {
+			if (item->nodes[idx] == mtd_get_of_node(mtd)) {
 				is_mtd_found = true;
 				break;
 			}
@@ -116,7 +116,7 @@ int mtd_virt_concat_destroy(struct mtd_info *mtd)
 		 */
 		for (idx = 0; idx < concat->num_subdev; idx++) {
 			child = concat->subdev[idx];
-			if (child->dev.of_node != mtd->dev.of_node) {
+			if (mtd_get_of_node(child) != mtd_get_of_node(mtd)) {
 				ret = add_mtd_device(child);
 				if (ret)
 					goto out;
@@ -223,7 +223,7 @@ bool mtd_virt_concat_add(struct mtd_info *mtd)
 	list_for_each_entry(item, &concat_node_list, head) {
 		concat = item->concat;
 		for (idx = 0; idx < item->count; idx++) {
-			if (item->nodes[idx] == mtd->dev.of_node) {
+			if (item->nodes[idx] == mtd_get_of_node(mtd)) {
 				concat->subdev[concat->num_subdev++] = mtd;
 				return true;
 			}
@@ -333,8 +333,8 @@ int mtd_virt_concat_create_join(void)
 			}
 			concat->mtd = *mtd;
 			/* Arbitrary set the first device as parent */
-			concat->mtd.dev.parent = concat->subdev[0]->dev.parent;
-			concat->mtd.dev = concat->subdev[0]->dev;
+			concat->mtd.parent_dev = concat->subdev[0]->parent_dev;
+			mtd_set_of_node(&concat->mtd, mtd_get_of_node(concat->subdev[0]));
 
 			/* Add the mtd device */
 			ret = add_mtd_device(&concat->mtd);

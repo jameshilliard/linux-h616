@@ -160,7 +160,7 @@ static int ts72xx_nand_probe(struct platform_device *pdev)
 
 	nand_set_flash_node(&data->chip, to_of_node(child));
 	mtd = nand_to_mtd(&data->chip);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 	platform_set_drvdata(pdev, data);
 
 	/*

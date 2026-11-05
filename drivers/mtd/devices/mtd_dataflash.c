@@ -653,7 +653,7 @@ static int add_dataflash_otp(struct spi_device *spi, char *name, int nr_pages,
 	device->_write = dataflash_write;
 	device->priv = priv;
 
-	device->dev.parent = &spi->dev;
+	device->parent_dev = &spi->dev;
 	mtd_set_of_node(device, spi->dev.of_node);
 
 	if (revision >= 'c')

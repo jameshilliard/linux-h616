@@ -1216,7 +1216,7 @@ int denali_chip_init(struct denali_controller *denali,
 		}
 	}
 
-	mtd->dev.parent = denali->dev;
+	mtd->parent_dev = denali->dev;
 
 	/*
 	 * Fallback to the default name if DT did not give "label" property.

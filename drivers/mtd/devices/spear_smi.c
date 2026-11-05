@@ -885,7 +885,7 @@ static int spear_smi_setup_banks(struct platform_device *pdev,
 	else
 		flash->mtd.name = flash_devices[flash_index].name;
 
-	flash->mtd.dev.parent = &pdev->dev;
+	flash->mtd.parent_dev = &pdev->dev;
 	mtd_set_of_node(&flash->mtd, np);
 	flash->mtd.type = MTD_NORFLASH;
 	flash->mtd.writesize = 1;

@@ -1669,7 +1669,7 @@ static int stfsm_write(struct stfsm *fsm, const uint8_t *buf,
 static int stfsm_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 			  size_t *retlen, u_char *buf)
 {
-	struct stfsm *fsm = dev_get_drvdata(mtd->dev.parent);
+	struct stfsm *fsm = dev_get_drvdata(mtd->parent_dev);
 	uint32_t bytes;
 
 	dev_dbg(fsm->dev, "%s from 0x%08x, len %zd\n",
@@ -1745,7 +1745,7 @@ static int stfsm_erase_chip(struct stfsm *fsm)
 static int stfsm_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
 			   size_t *retlen, const u_char *buf)
 {
-	struct stfsm *fsm = dev_get_drvdata(mtd->dev.parent);
+	struct stfsm *fsm = dev_get_drvdata(mtd->parent_dev);
 
 	u32 page_offs;
 	u32 bytes;
@@ -1790,7 +1790,7 @@ out1:
  */
 static int stfsm_mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
 {
-	struct stfsm *fsm = dev_get_drvdata(mtd->dev.parent);
+	struct stfsm *fsm = dev_get_drvdata(mtd->parent_dev);
 	u32 addr, len;
 	int ret;
 
@@ -2074,7 +2074,7 @@ static int stfsm_probe(struct platform_device *pdev)
 		return ret;
 
 	fsm->mtd.name		= info->name;
-	fsm->mtd.dev.parent	= &pdev->dev;
+	fsm->mtd.parent_dev	= &pdev->dev;
 	mtd_set_of_node(&fsm->mtd, np);
 	fsm->mtd.type		= MTD_NORFLASH;
 	fsm->mtd.writesize	= 4;

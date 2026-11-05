@@ -1254,7 +1254,7 @@ static int rnandc_chip_init(struct rnandc *rnandc, struct device_node *np)
 	nand_set_flash_node(chip, np);
 
 	mtd = nand_to_mtd(chip);
-	mtd->dev.parent = rnandc->dev;
+	mtd->parent_dev = rnandc->dev;
 	if (!mtd->name) {
 		dev_err(rnandc->dev, "Missing MTD label\n");
 		return -EINVAL;

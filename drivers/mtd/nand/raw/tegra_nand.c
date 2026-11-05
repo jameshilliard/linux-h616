@@ -1115,7 +1115,7 @@ static int tegra_nand_chips_init(struct device *dev,
 
 	mtd = nand_to_mtd(chip);
 
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	mtd->owner = THIS_MODULE;
 
 	nand_set_flash_node(chip, np_nand);

@@ -510,7 +510,7 @@ static int intel_dg_mtd_erase(struct mtd_info *mtd, struct erase_info *info)
 		return -EINVAL;
 
 	if (!IS_ALIGNED(info->addr, SZ_4K) || !IS_ALIGNED(info->len, SZ_4K)) {
-		dev_err(&mtd->dev, "unaligned erase %llx %llx\n",
+		dev_err(mtd->dev, "unaligned erase %llx %llx\n",
 			info->addr, info->len);
 		info->fail_addr = MTD_FAIL_ADDR_UNKNOWN;
 		return -EINVAL;
@@ -521,7 +521,7 @@ static int intel_dg_mtd_erase(struct mtd_info *mtd, struct erase_info *info)
 
 	ret = pm_runtime_resume_and_get(nvm->dev);
 	if (ret < 0) {
-		dev_err(&mtd->dev, "rpm: get failed %d\n", ret);
+		dev_err(mtd->dev, "rpm: get failed %d\n", ret);
 		return ret;
 	}
 
@@ -530,7 +530,7 @@ static int intel_dg_mtd_erase(struct mtd_info *mtd, struct erase_info *info)
 
 	while (total_len > 0) {
 		if (!IS_ALIGNED(addr, SZ_4K) || !IS_ALIGNED(total_len, SZ_4K)) {
-			dev_err(&mtd->dev, "unaligned erase %llx %zx\n", addr, total_len);
+			dev_err(mtd->dev, "unaligned erase %llx %zx\n", addr, total_len);
 			info->fail_addr = addr;
 			ret = -ERANGE;
 			break;
@@ -538,7 +538,7 @@ static int intel_dg_mtd_erase(struct mtd_info *mtd, struct erase_info *info)
 
 		idx = idg_nvm_get_region(nvm, addr);
 		if (idx >= nvm->nregions) {
-			dev_err(&mtd->dev, "out of range");
+			dev_err(mtd->dev, "out of range");
 			info->fail_addr = MTD_FAIL_ADDR_UNKNOWN;
 			ret = -ERANGE;
 			break;
@@ -550,12 +550,12 @@ static int intel_dg_mtd_erase(struct mtd_info *mtd, struct erase_info *info)
 		if (len > nvm->regions[idx].size - from)
 			len = nvm->regions[idx].size - from;
 
-		dev_dbg(&mtd->dev, "erasing region[%d] %s from %llx len %zx\n",
+		dev_dbg(mtd->dev, "erasing region[%d] %s from %llx len %zx\n",
 			region, nvm->regions[idx].name, from, len);
 
 		bytes = idg_erase(nvm, region, from, len, &info->fail_addr);
 		if (bytes < 0) {
-			dev_dbg(&mtd->dev, "erase failed with %zd\n", bytes);
+			dev_dbg(mtd->dev, "erase failed with %zd\n", bytes);
 			info->fail_addr += nvm->regions[idx].offset;
 			ret = bytes;
 			break;
@@ -582,11 +582,11 @@ static int intel_dg_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 
 	idx = idg_nvm_get_region(nvm, from);
 
-	dev_dbg(&mtd->dev, "reading region[%d] %s from %lld len %zd\n",
+	dev_dbg(mtd->dev, "reading region[%d] %s from %lld len %zd\n",
 		nvm->regions[idx].id, nvm->regions[idx].name, from, len);
 
 	if (idx >= nvm->nregions) {
-		dev_err(&mtd->dev, "out of range");
+		dev_err(mtd->dev, "out of range");
 		return -ERANGE;
 	}
 
@@ -597,7 +597,7 @@ static int intel_dg_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 
 	ret = pm_runtime_resume_and_get(nvm->dev);
 	if (ret < 0) {
-		dev_err(&mtd->dev, "rpm: get failed %zd\n", ret);
+		dev_err(mtd->dev, "rpm: get failed %zd\n", ret);
 		return ret;
 	}
 
@@ -605,7 +605,7 @@ static int intel_dg_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 
 	ret = idg_read(nvm, region, from, len, buf);
 	if (ret < 0) {
-		dev_dbg(&mtd->dev, "read failed with %zd\n", ret);
+		dev_dbg(mtd->dev, "read failed with %zd\n", ret);
 	} else {
 		*retlen = ret;
 		ret = 0;
@@ -628,11 +628,11 @@ static int intel_dg_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
 
 	idx = idg_nvm_get_region(nvm, to);
 
-	dev_dbg(&mtd->dev, "writing region[%d] %s to %lld len %zd\n",
+	dev_dbg(mtd->dev, "writing region[%d] %s to %lld len %zd\n",
 		nvm->regions[idx].id, nvm->regions[idx].name, to, len);
 
 	if (idx >= nvm->nregions) {
-		dev_err(&mtd->dev, "out of range");
+		dev_err(mtd->dev, "out of range");
 		return -ERANGE;
 	}
 
@@ -643,7 +643,7 @@ static int intel_dg_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
 
 	ret = pm_runtime_resume_and_get(nvm->dev);
 	if (ret < 0) {
-		dev_err(&mtd->dev, "rpm: get failed %zd\n", ret);
+		dev_err(mtd->dev, "rpm: get failed %zd\n", ret);
 		return ret;
 	}
 
@@ -651,7 +651,7 @@ static int intel_dg_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
 
 	ret = idg_write(nvm, region, to, len, buf);
 	if (ret < 0) {
-		dev_dbg(&mtd->dev, "write failed with %zd\n", ret);
+		dev_dbg(mtd->dev, "write failed with %zd\n", ret);
 	} else {
 		*retlen = ret;
 		ret = 0;
@@ -707,7 +707,7 @@ static int intel_dg_nvm_init_mtd(struct intel_dg_nvm *nvm, struct device *device
 	dev_dbg(device, "registering with mtd\n");
 
 	nvm->mtd.owner = THIS_MODULE;
-	nvm->mtd.dev.parent = device;
+	nvm->mtd.parent_dev = device;
 	nvm->mtd.flags = MTD_CAP_NORFLASH;
 	nvm->mtd.type = MTD_DATAFLASH;
 	nvm->mtd.priv = nvm;

@@ -515,7 +515,7 @@ static int mxic_nfc_probe(struct platform_device *pdev)
 
 	nand_chip = &nfc->chip;
 	mtd = nand_to_mtd(nand_chip);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	for_each_child_of_node(np, nand_np)
 		nand_set_flash_node(nand_chip, nand_np);

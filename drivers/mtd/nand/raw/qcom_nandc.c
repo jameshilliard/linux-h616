@@ -2031,7 +2031,7 @@ static int qcom_nand_host_init(struct qcom_nand_controller *nandc,
 		return -ENOMEM;
 
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	/*
 	 * the bad block marker is readable only when we read the last codeword

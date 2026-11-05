@@ -513,7 +513,7 @@ static int omap2_onenand_probe(struct platform_device *pdev)
 
 	c->pdev = pdev;
 	c->mtd.priv = &c->onenand;
-	c->mtd.dev.parent = dev;
+	c->mtd.parent_dev = dev;
 	mtd_set_of_node(&c->mtd, dev->of_node);
 
 	dev_info(dev, "initializing on CS%d (0x%08lx), va %p, %s mode\n",

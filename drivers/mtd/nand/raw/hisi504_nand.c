@@ -762,7 +762,7 @@ static int hisi_nfc_probe(struct platform_device *pdev)
 		return PTR_ERR(host->mmio);
 
 	mtd->name		= "hisi_nand";
-	mtd->dev.parent         = &pdev->dev;
+	mtd->parent_dev         = &pdev->dev;
 
 	nand_set_controller_data(chip, host);
 	nand_set_flash_node(chip, np);

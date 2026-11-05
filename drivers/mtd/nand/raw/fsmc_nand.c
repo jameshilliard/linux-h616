@@ -1102,7 +1102,7 @@ static int __init fsmc_nand_probe(struct platform_device *pdev)
 	mtd = nand_to_mtd(&host->nand);
 	nand_set_flash_node(nand, pdev->dev.of_node);
 
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	nand->badblockbits = 7;
 

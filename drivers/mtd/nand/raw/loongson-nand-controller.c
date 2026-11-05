@@ -862,7 +862,7 @@ static int loongson_nand_chip_init(struct loongson_nand_host *host)
 	chip->controller = &host->controller;
 	chip->options = NAND_NO_SUBPAGE_WRITE | NAND_USES_DMA | NAND_BROKEN_XD;
 	chip->buf_align = 16;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	mtd->owner = THIS_MODULE;
 
 	ret = nand_scan(chip, 1);

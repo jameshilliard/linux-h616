@@ -196,7 +196,7 @@ static int gpio_nand_setup_interface(struct nand_chip *this, int csline,
 {
 	struct gpio_nand *priv = nand_get_controller_data(this);
 	const struct nand_sdr_timings *sdr = nand_get_sdr_timings(cf);
-	struct device *dev = &nand_to_mtd(this)->dev;
+	struct device *dev = nand_to_mtd(this)->parent_dev;
 
 	if (IS_ERR(sdr))
 		return PTR_ERR(sdr);
@@ -258,7 +258,7 @@ static int gpio_nand_probe(struct platform_device *pdev)
 	this = &priv->nand_chip;
 
 	mtd = nand_to_mtd(this);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	nand_set_controller_data(this, priv);
 	nand_set_flash_node(this, pdev->dev.of_node);

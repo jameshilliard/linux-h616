@@ -2237,7 +2237,7 @@ static int omap_nand_probe(struct platform_device *pdev)
 
 	nand_chip		= &info->nand;
 	mtd			= nand_to_mtd(nand_chip);
-	mtd->dev.parent		= &pdev->dev;
+	mtd->parent_dev		= &pdev->dev;
 	nand_set_flash_node(nand_chip, dev->of_node);
 
 	if (!mtd->name) {

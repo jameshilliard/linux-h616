@@ -193,7 +193,7 @@ static int mchp23k256_probe(struct spi_device *spi)
 		flash->caps = &mchp23k256_caps;
 
 	mtd_set_of_node(&flash->mtd, spi->dev.of_node);
-	flash->mtd.dev.parent	= &spi->dev;
+	flash->mtd.parent_dev	= &spi->dev;
 	flash->mtd.type		= MTD_RAM;
 	flash->mtd.flags	= MTD_CAP_RAM;
 	flash->mtd.writesize	= 1;

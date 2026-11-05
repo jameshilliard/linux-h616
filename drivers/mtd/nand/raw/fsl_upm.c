@@ -50,7 +50,7 @@ static int fun_chip_init(struct fsl_upm_nand *fun,
 	fun->chip.ecc.engine_type = NAND_ECC_ENGINE_TYPE_SOFT;
 	fun->chip.ecc.algo = NAND_ECC_ALGO_HAMMING;
 	fun->chip.controller = &fun->base;
-	mtd->dev.parent = fun->dev;
+	mtd->parent_dev = fun->dev;
 
 	flash_np = of_get_next_child(upm_np, NULL);
 	if (!flash_np)

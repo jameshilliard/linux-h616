@@ -2011,7 +2011,7 @@ static int stm32_fmc2_nfc_probe(struct platform_device *pdev)
 	nand = &nfc->nand;
 	chip = &nand->chip;
 	mtd = nand_to_mtd(chip);
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	chip->controller = &nfc->base;
 	chip->options |= NAND_BUSWIDTH_AUTO | NAND_NO_SUBPAGE_WRITE |

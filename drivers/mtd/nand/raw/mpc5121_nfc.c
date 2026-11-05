@@ -655,7 +655,7 @@ static int mpc5121_nfc_probe(struct platform_device *op)
 	prv->controller.ops = &mpc5121_nfc_ops;
 	chip->controller = &prv->controller;
 
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	nand_set_controller_data(chip, prv);
 	nand_set_flash_node(chip, dn);
 	prv->dev = dev;

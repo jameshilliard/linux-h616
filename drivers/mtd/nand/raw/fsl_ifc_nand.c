@@ -868,7 +868,7 @@ static int fsl_ifc_chip_init(struct fsl_ifc_mtd *priv)
 	int ret;
 
 	/* Fill in fsl_ifc_mtd structure */
-	mtd->dev.parent = priv->dev;
+	mtd->parent_dev = priv->dev;
 
 	struct device_node *np __free(device_node) =
 		of_get_next_child_with_prefix(priv->dev->of_node, NULL, "nand");

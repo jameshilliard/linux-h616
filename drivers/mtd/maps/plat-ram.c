@@ -163,7 +163,7 @@ static int platram_probe(struct platform_device *pdev)
 		goto exit_free;
 	}
 
-	info->mtd->dev.parent = &pdev->dev;
+	info->mtd->parent_dev = &pdev->dev;
 
 	platram_setrw(info, PLATRAM_RW);
 

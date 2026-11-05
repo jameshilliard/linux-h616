@@ -2723,7 +2723,7 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
 		chip->options |= NAND_KEEP_TIMINGS;
 
 	mtd = nand_to_mtd(chip);
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	/*
 	 * Save a reference value for timing registers before

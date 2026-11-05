@@ -87,7 +87,7 @@ static int nand_flash_detect_ext_param_page(struct nand_chip *chip,
 		s = ep->sections + i;
 		section_len = s->length * 16;
 		if (section_len > remaining) {
-			dev_dbg(&mtd->dev,
+			dev_dbg(mtd->dev,
 				"ONFI extended parameter section %d exceeds page\n",
 				i);
 			goto ext_out;
@@ -95,7 +95,7 @@ static int nand_flash_detect_ext_param_page(struct nand_chip *chip,
 
 		if (s->type == ONFI_SECTION_TYPE_2) {
 			if (section_len < sizeof(*ecc)) {
-				dev_dbg(&mtd->dev,
+				dev_dbg(mtd->dev,
 					"ONFI extended parameter ECC section %d is too short\n",
 					i);
 				goto ext_out;

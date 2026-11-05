@@ -3048,7 +3048,7 @@ static int cadence_nand_chip_init(struct cdns_nand_ctrl *cdns_ctrl,
 	nand_set_flash_node(chip, np);
 
 	mtd = nand_to_mtd(chip);
-	mtd->dev.parent = cdns_ctrl->dev;
+	mtd->parent_dev = cdns_ctrl->dev;
 
 	/*
 	 * Default to HW ECC engine mode. If the nand-ecc-mode property is given

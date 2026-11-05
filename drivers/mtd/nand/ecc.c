@@ -664,7 +664,6 @@ static struct nand_ecc_engine *nand_ecc_match_on_host_hw_engine(struct device *d
 struct nand_ecc_engine *nand_ecc_get_on_host_hw_engine(struct nand_device *nand)
 {
 	struct nand_ecc_engine *engine = NULL;
-	struct device *dev = &nand->mtd.dev;
 	struct platform_device *pdev;
 	struct device_node *np;
 
@@ -672,7 +671,7 @@ struct nand_ecc_engine *nand_ecc_get_on_host_hw_engine(struct nand_device *nand)
 		return NULL;
 
 	/* Check for an explicit nand-ecc-engine property */
-	np = of_parse_phandle(dev->of_node, "nand-ecc-engine", 0);
+	np = of_parse_phandle(mtd_get_of_node(&nand->mtd), "nand-ecc-engine", 0);
 	if (np) {
 		pdev = of_find_device_by_node(np);
 		if (!pdev)
