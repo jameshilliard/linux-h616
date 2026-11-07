@@ -1212,10 +1212,13 @@ static int tegra_nand_probe(struct platform_device *pdev)
 
 	err = tegra_nand_chips_init(ctrl->dev, ctrl);
 	if (err)
-		goto err_put_pm;
+		goto err_free_irq;
 
 	return 0;
 
+err_free_irq:
+	writel_relaxed(0, ctrl->regs + IER);
+	devm_free_irq(ctrl->dev, ctrl->irq, ctrl);
 err_put_pm:
 	pm_runtime_put_sync_suspend(ctrl->dev);
 	pm_runtime_force_suspend(ctrl->dev);
@@ -1233,6 +1236,9 @@ static void tegra_nand_remove(struct platform_device *pdev)
 	WARN_ON(mtd_device_unregister(mtd));
 
 	nand_cleanup(chip);
+
+	writel_relaxed(0, ctrl->regs + IER);
+	devm_free_irq(ctrl->dev, ctrl->irq, ctrl);
 
 	pm_runtime_put_sync_suspend(ctrl->dev);
 	pm_runtime_force_suspend(ctrl->dev);
