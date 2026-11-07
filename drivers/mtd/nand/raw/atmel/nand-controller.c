@@ -263,6 +263,7 @@ struct atmel_hsmc_nand_controller {
 	struct completion complete;
 	u32 cfg;
 	int irq;
+	bool irq_requested;
 
 	/* Only used when instantiating from legacy DT bindings. */
 	struct clk *clk;
@@ -2334,6 +2335,9 @@ atmel_hsmc_nand_controller_remove(struct atmel_nand_controller *nc)
 	regmap_write(hsmc_nc->base.smc, ATMEL_HSMC_NFC_CTRL,
 		     ATMEL_HSMC_NFC_CTRL_DIS);
 
+	if (hsmc_nc->irq_requested)
+		devm_free_irq(nc->dev, hsmc_nc->irq, hsmc_nc);
+
 	if (hsmc_nc->sram.pool)
 		gen_pool_free(hsmc_nc->sram.pool,
 			      (unsigned long)hsmc_nc->sram.virt,
@@ -2382,6 +2386,8 @@ static int atmel_hsmc_nand_controller_probe(struct platform_device *pdev,
 			ret);
 		goto err;
 	}
+
+	nc->irq_requested = true;
 
 	/* Initial NFC configuration. */
 	regmap_write(nc->base.smc, ATMEL_HSMC_NFC_CFG,
