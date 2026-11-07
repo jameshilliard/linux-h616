@@ -213,6 +213,7 @@ void nand_release_device(struct nand_chip *chip)
 	mutex_unlock(&chip->controller->lock);
 	mutex_unlock(&chip->lock);
 }
+EXPORT_SYMBOL_GPL(nand_release_device);
 
 /**
  * nand_bbm_get_next_page - Get the next page for bad block markers
@@ -355,6 +356,7 @@ int nand_get_device(struct nand_chip *chip)
 			   READ_ONCE(chip->disconnected));
 	}
 }
+EXPORT_SYMBOL_GPL(nand_get_device);
 
 /**
  * nand_disconnect - drain hardware access and reject further operations

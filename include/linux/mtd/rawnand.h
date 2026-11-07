@@ -1624,6 +1624,8 @@ void nand_wait_ready(struct nand_chip *chip);
  */
 void nand_cleanup(struct nand_chip *chip);
 void nand_disconnect(struct nand_chip *chip);
+int nand_get_device(struct nand_chip *chip);
+void nand_release_device(struct nand_chip *chip);
 int nand_set_lifetime(struct nand_chip *chip, void *allocation);
 int nand_set_shared_lifetime(struct nand_chip *chip, struct nand_storage *storage);
 
