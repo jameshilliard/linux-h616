@@ -10,3 +10,4 @@ Memory Technology Device (MTD)
    spi-intel
    nand_ecc
    spi-nor
+   sunxi-bootrom

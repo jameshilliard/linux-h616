@@ -291,6 +291,7 @@ struct sunxi_nfc_oob_ops {
  * struct sunxi_nand_chip - stores NAND chip device related information
  *
  * @node: used to store NAND chips into a list
+ * @boot_views: BootROM-format MTD devices backed by this chip
  * @nand: base NAND chip structure
  * @ecc: ECC controller structure
  * @oob_ops: OOB geometry and ECC-result interpretation
@@ -304,6 +305,7 @@ struct sunxi_nfc_oob_ops {
  */
 struct sunxi_nand_chip {
 	struct list_head node;
+	struct list_head boot_views;
 	struct nand_chip nand;
 	struct sunxi_nand_hw_ecc ecc;
 	const struct sunxi_nfc_oob_ops *oob_ops;
@@ -2783,6 +2785,458 @@ static const struct nand_controller_ops sunxi_nand_controller_ops = {
 	.exec_op = sunxi_nfc_exec_op,
 };
 
+/* One BootROM data unit occupies a complete physical NAND page. */
+#define SUNXI_NAND_BOOT_DATA_SIZE		1024
+#define SUNXI_NAND_BOOT_PAGE_SIZE		2048
+#define SUNXI_NAND_BOOT_ECC_STRENGTH	80
+#define SUNXI_NAND_BOOT_USER_DATA		0x010300ff
+
+struct sunxi_nand_boot {
+	struct list_head node;
+	struct mtd_info mtd;
+	struct mutex lock; /* Serializes requests and detachment from the NAND chip. */
+	struct nand_chip *nand;
+	u64 offset;
+	u8 *buf;
+	u32 ecc_ctl;
+};
+
+static struct sunxi_nand_boot *to_sunxi_nand_boot(struct mtd_info *mtd)
+{
+	return container_of(mtd, struct sunxi_nand_boot, mtd);
+}
+
+static int sunxi_nand_boot_page(struct sunxi_nand_boot *boot, unsigned int page,
+				bool write, bool raw)
+{
+	struct nand_chip *nand = boot->nand;
+	struct sunxi_nfc *nfc = to_sunxi_nfc(nand->controller);
+	struct mtd_info *mtd = &boot->mtd;
+	unsigned int seed = page % ARRAY_SIZE(sunxi_nfc_randomizer_page_seeds);
+	u32 ctl = boot->ecc_ctl |
+		  NFC_RANDOM_SEED(sunxi_nfc_randomizer_page_seeds[seed]);
+	unsigned int record_size = mtd->writesize + mtd->oobsize;
+	int ret;
+
+	sunxi_nfc_hw_ecc_disable(nand);
+	if (raw) {
+		if (write) {
+			ret = nand_prog_page_begin_op(nand, page, 0, boot->buf, record_size);
+			if (ret)
+				return ret;
+			return nand_prog_page_end_op(nand);
+		}
+		return nand_read_page_op(nand, page, 0, boot->buf, record_size);
+	}
+
+	if (write)
+		ret = nand_prog_page_begin_op(nand, page, 0, NULL, 0);
+	else
+		ret = nand_read_page_op(nand, page, 0, NULL, 0);
+	if (ret)
+		return ret;
+
+	sunxi_nfc_reset_user_data_len(nfc);
+	writel(boot->ecc_ctl & ~NFC_RANDOM_EN(nfc), nfc->regs + NFC_REG_ECC_CTL);
+	writel(ctl, nfc->regs + NFC_REG_ECC_CTL);
+	if (write)
+		ret = sunxi_nfc_write_buf(nand, boot->buf, SUNXI_NAND_BOOT_DATA_SIZE);
+	else
+		ret = sunxi_nfc_read_buf(nand, NULL, SUNXI_NAND_BOOT_DATA_SIZE);
+	writel(ctl & ~NFC_RANDOM_EN(nfc), nfc->regs + NFC_REG_ECC_CTL);
+	if (ret)
+		goto out;
+
+	if (write) {
+		/* Reissue the column before appending protected user data and ECC. */
+		ret = nand_change_write_column_op(nand, SUNXI_NAND_BOOT_DATA_SIZE,
+						  NULL, 0, false);
+		if (ret)
+			goto out;
+	}
+
+	/* ECC_OP appends/consumes the user data and parity at the current column. */
+	sunxi_nfc_set_user_data_len_pio(nfc, USER_DATA_SZ);
+	writel(ctl, nfc->regs + NFC_REG_ECC_CTL);
+	if (write)
+		writel(SUNXI_NAND_BOOT_USER_DATA, nfc->regs + NFC_REG_USER_DATA(nfc, 0));
+	writel(NFC_DATA_TRANS | NFC_DATA_SWAP_METHOD | NFC_ECC_OP |
+	       (write ? NFC_ACCESS_DIR : 0), nfc->regs + NFC_REG_CMD);
+	ret = sunxi_nfc_wait_events(nfc, NFC_CMD_INT_FLAG, false, 0);
+	if (ret)
+		goto out;
+
+	if (!write) {
+		memcpy_fromio(boot->buf, nfc->regs + NFC_RAM0_BASE, SUNXI_NAND_BOOT_DATA_SIZE);
+		if (readl(nfc->regs + NFC_REG_ECC_ST) & NFC_ECC_ERR(0)) {
+			mtd->ecc_stats.failed++;
+			ret = -EBADMSG;
+		} else {
+			ret = NFC_ECC_ERR_CNT(0, readl(nfc->regs + NFC_REG_ECC_ERR_CNT(nfc, 0)));
+			mtd->ecc_stats.corrected += ret;
+		}
+	}
+out:
+	sunxi_nfc_hw_ecc_disable(nand);
+	if (write) {
+		if (!ret)
+			ret = nand_prog_page_end_op(nand);
+		else
+			nand_reset(nand, nand->cur_cs);
+	}
+	return ret;
+}
+
+static int sunxi_nand_boot_io(struct mtd_info *mtd, loff_t from,
+			      struct mtd_oob_ops *ops, bool write)
+{
+	struct sunxi_nand_boot *boot = to_sunxi_nand_boot(mtd);
+	struct nand_chip *nand;
+	size_t data_left = ops->len, oob_left = ops->ooblen;
+	unsigned int column = from % mtd->writesize;
+	unsigned int oob_column = ops->ooboffs;
+	unsigned int page;
+	int ret, max_bitflips = 0;
+	bool failed = false;
+	u8 status;
+
+	if (ops->mode != MTD_OPS_RAW && oob_left)
+		return -EOPNOTSUPP;
+	if (write && (column || data_left % mtd->writesize))
+		return -EINVAL;
+
+	guard(mutex)(&boot->lock);
+	nand = boot->nand;
+	if (!nand)
+		return -ENODEV;
+	ret = nand_get_device(nand);
+	if (ret)
+		return ret;
+
+	nand_select_target(nand, 0);
+	page = (boot->offset >> nand->page_shift) + from / mtd->writesize;
+	if (write) {
+		nand->pagecache.page = -1;
+		ret = nand_status_op(nand, &status);
+		if (ret)
+			goto out;
+		if (!(status & NAND_STATUS_WP)) {
+			ret = -EROFS;
+			goto out;
+		}
+	}
+
+	while (data_left || oob_left) {
+		size_t data_len = min_t(size_t, data_left, mtd->writesize - column);
+		size_t oob_len = min_t(size_t, oob_left, mtd->oobsize - oob_column);
+
+		if (write) {
+			memset(boot->buf, 0xff, mtd->writesize + mtd->oobsize);
+			if (data_len)
+				memcpy(boot->buf, ops->datbuf + ops->retlen, data_len);
+			if (oob_len)
+				memcpy(boot->buf + mtd->writesize + oob_column,
+				       ops->oobbuf + ops->oobretlen, oob_len);
+		}
+		ret = sunxi_nand_boot_page(boot, page, write, ops->mode == MTD_OPS_RAW);
+		if (ret < 0 && ret != -EBADMSG)
+			goto out;
+		if (ret == -EBADMSG) {
+			failed = true;
+			if (ops->stats)
+				ops->stats->uncorrectable_errors++;
+		} else {
+			max_bitflips = max(max_bitflips, ret);
+			if (ops->stats) {
+				ops->stats->corrected_bitflips += ret;
+				ops->stats->max_bitflips = max_bitflips;
+			}
+		}
+		if (!write) {
+			if (data_len)
+				memcpy(ops->datbuf + ops->retlen, boot->buf + column, data_len);
+			if (oob_len)
+				memcpy(ops->oobbuf + ops->oobretlen,
+				       boot->buf + mtd->writesize + oob_column, oob_len);
+		}
+		ops->retlen += data_len;
+		ops->oobretlen += oob_len;
+		data_left -= data_len;
+		oob_left -= oob_len;
+		column = 0;
+		oob_column = 0;
+		page++;
+	}
+	ret = failed ? -EBADMSG : max_bitflips;
+out:
+	nand_deselect_target(nand);
+	nand_release_device(nand);
+	return ret;
+}
+
+static int sunxi_nand_boot_read_oob(struct mtd_info *mtd, loff_t from,
+				    struct mtd_oob_ops *ops)
+{
+	return sunxi_nand_boot_io(mtd, from, ops, false);
+}
+
+static int sunxi_nand_boot_write_oob(struct mtd_info *mtd, loff_t to,
+				     struct mtd_oob_ops *ops)
+{
+	return sunxi_nand_boot_io(mtd, to, ops, true);
+}
+
+static int sunxi_nand_boot_erase(struct mtd_info *mtd, struct erase_info *instr)
+{
+	struct sunxi_nand_boot *boot = to_sunxi_nand_boot(mtd);
+	struct nand_chip *nand;
+	u64 addr;
+	unsigned int block;
+	u8 status;
+	int ret;
+
+	if (instr->addr % mtd->erasesize || instr->len % mtd->erasesize)
+		return -EINVAL;
+	guard(mutex)(&boot->lock);
+	nand = boot->nand;
+	if (!nand)
+		return -ENODEV;
+	ret = nand_get_device(nand);
+	if (ret)
+		return ret;
+	nand_select_target(nand, 0);
+	nand->pagecache.page = -1;
+	ret = nand_status_op(nand, &status);
+	if (ret)
+		goto out;
+	if (!(status & NAND_STATUS_WP)) {
+		ret = -EROFS;
+		goto out;
+	}
+	block = boot->offset >> nand->phys_erase_shift;
+	block += instr->addr / mtd->erasesize;
+	for (addr = instr->addr; addr < instr->addr + instr->len; addr += mtd->erasesize) {
+		ret = nand_erase_op(nand, block++);
+		if (ret) {
+			instr->fail_addr = addr;
+			break;
+		}
+	}
+out:
+	nand_deselect_target(nand);
+	nand_release_device(nand);
+	return ret;
+}
+
+static int sunxi_nand_boot_isbad(struct mtd_info *mtd, loff_t ofs)
+{
+	struct sunxi_nand_boot *boot = to_sunxi_nand_boot(mtd);
+
+	guard(mutex)(&boot->lock);
+	/* Ordinary-format BBM bytes can contain BootROM payload or parity. */
+	return boot->nand ? 0 : -ENODEV;
+}
+
+static void sunxi_nand_boot_release(struct mtd_info *mtd)
+{
+	struct sunxi_nand_boot *boot = to_sunxi_nand_boot(mtd);
+
+	kfree(mtd->name);
+	kfree(boot->buf);
+	kfree(boot);
+}
+
+static void sunxi_nand_boot_cleanup(struct sunxi_nand_chip *chip)
+{
+	struct sunxi_nand_boot *boot, *next;
+
+	list_for_each_entry_safe(boot, next, &chip->boot_views, node) {
+		scoped_guard(mutex, &boot->lock)
+			boot->nand = NULL;
+		mtd_device_unregister(&boot->mtd);
+		list_del(&boot->node);
+		mtd_put_master(&boot->mtd);
+	}
+}
+
+static int sunxi_nand_boot_register(struct sunxi_nand_chip *chip,
+				    const struct mtd_partition *part)
+{
+	static const char * const no_parsers[] = { NULL };
+	struct nand_chip *nand = &chip->nand;
+	struct mtd_info *native = nand_to_mtd(nand);
+	struct sunxi_nfc *nfc = to_sunxi_nfc(nand->controller);
+	struct sunxi_nand_boot *boot;
+	struct mtd_info *mtd;
+	int ret, mode;
+
+	/* H616 BootROM format on single-target, 8-bit, 2-KiB-page NAND. */
+	if (!of_device_is_compatible(nfc->dev->of_node, "allwinner,sun50i-h616-nand-controller") ||
+	    native->writesize != SUNXI_NAND_BOOT_PAGE_SIZE || nanddev_ntargets(&nand->base) != 1 ||
+	    nand->options & NAND_BUSWIDTH_16)
+		return -EOPNOTSUPP;
+	if (mtd_mod_by_eb(part->offset, native) || mtd_mod_by_eb(part->size, native))
+		return -EINVAL;
+	if (part->add_flags || (part->mask_flags & ~MTD_WRITEABLE))
+		return -EOPNOTSUPP;
+	for (mode = 0; mode < nfc->caps->nstrengths; mode++)
+		if (nfc->caps->ecc_strengths[mode] == SUNXI_NAND_BOOT_ECC_STRENGTH)
+			break;
+	if (mode == nfc->caps->nstrengths)
+		return -EOPNOTSUPP;
+	boot = kzalloc_obj(*boot);
+	if (!boot)
+		return -ENOMEM;
+	mtd = &boot->mtd;
+	mtd->name = kstrdup(part->name, GFP_KERNEL);
+	boot->buf = kmalloc(native->writesize + native->oobsize, GFP_KERNEL);
+	if (!mtd->name || !boot->buf) {
+		sunxi_nand_boot_release(mtd);
+		return -ENOMEM;
+	}
+	mutex_init(&boot->lock);
+	boot->nand = nand;
+	boot->offset = part->offset;
+	boot->ecc_ctl = NFC_ECC_EN | NFC_ECC_PIPELINE | NFC_ECC_MODE(nfc, mode) |
+			NFC_RANDOM_EN(nfc);
+	mtd->owner = THIS_MODULE;
+	mtd->parent_dev = nfc->dev;
+	mtd_set_of_node(mtd, part->of_node);
+	mtd->type = MTD_NANDFLASH;
+	mtd->flags = native->flags & ~(MTD_BIT_WRITEABLE | part->mask_flags);
+	mtd->size = div_u64(part->size, native->writesize) * SUNXI_NAND_BOOT_DATA_SIZE;
+	mtd->erasesize = (native->erasesize / native->writesize) * SUNXI_NAND_BOOT_DATA_SIZE;
+	mtd->writesize = SUNXI_NAND_BOOT_DATA_SIZE;
+	mtd->writebufsize = mtd->writesize;
+	mtd->oobsize = native->writesize + native->oobsize - mtd->writesize;
+	mtd->ecc_strength = SUNXI_NAND_BOOT_ECC_STRENGTH;
+	mtd->ecc_step_size = SUNXI_NAND_BOOT_DATA_SIZE;
+	mtd->_read_oob = sunxi_nand_boot_read_oob;
+	mtd->_write_oob = sunxi_nand_boot_write_oob;
+	mtd->_erase = sunxi_nand_boot_erase;
+	mtd->_block_isbad = sunxi_nand_boot_isbad;
+	mtd_set_release(mtd, sunxi_nand_boot_release);
+	ret = mtd_device_parse_register(mtd, no_parsers, NULL, NULL, 0);
+	if (ret) {
+		mtd_put_master(mtd);
+		return ret;
+	}
+	list_add_tail(&boot->node, &chip->boot_views);
+	return 0;
+}
+
+static bool sunxi_nand_boot_partition(const struct mtd_partition *part)
+{
+	return of_property_read_bool(part->of_node, "allwinner,boot-format");
+}
+
+static int sunxi_nand_has_boot_partitions(struct nand_chip *chip)
+{
+	struct device_node *parts __free(device_node) =
+		of_get_child_by_name(nand_get_flash_node(chip), "partitions");
+
+	/* Disabled BootROM entries must not become native-format aliases either. */
+	for_each_child_of_node_scoped(parts, child)
+		if (of_property_read_bool(child, "allwinner,boot-format"))
+			return of_device_is_available(parts) ? 1 : -EINVAL;
+
+	return 0;
+}
+
+static int sunxi_nand_check_partitions(struct mtd_info *mtd,
+				       const struct mtd_partitions *parts)
+{
+	int i, j;
+
+	for (i = 0; i < parts->nr_parts; i++) {
+		const struct mtd_partition *part = &parts->parts[i];
+
+		if (!of_device_is_available(part->of_node))
+			continue;
+		if (!part->size || part->offset >= mtd->size ||
+		    part->size > mtd->size - part->offset)
+			return -EINVAL;
+	}
+
+	for (i = 0; i < parts->nr_parts; i++) {
+		const struct mtd_partition *boot = &parts->parts[i];
+
+		if (!of_device_is_available(boot->of_node) || !sunxi_nand_boot_partition(boot))
+			continue;
+		for (j = 0; j < parts->nr_parts; j++) {
+			const struct mtd_partition *other = &parts->parts[j];
+
+			if (i == j || !of_device_is_available(other->of_node))
+				continue;
+			if (boot->offset < other->offset + other->size &&
+			    other->offset < boot->offset + boot->size)
+				return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int sunxi_nand_register(struct sunxi_nand_chip *chip)
+{
+	static const char * const fixed_partitions[] = { "fixed-partitions", NULL };
+	static const char * const no_parsers[] = { NULL };
+	struct mtd_info *mtd = nand_to_mtd(&chip->nand);
+	struct mtd_partitions parts = { };
+	struct mtd_partition *native;
+	int ret, i, nr_native = 0;
+
+	ret = sunxi_nand_has_boot_partitions(&chip->nand);
+	if (ret < 0)
+		return ret;
+	if (!ret) {
+		ret = mtd_device_register(mtd, NULL, 0);
+		if (!ret)
+			chip->registered = true;
+		return ret;
+	}
+
+	/* A command-line partition table cannot describe per-partition formats. */
+	ret = mtd_parse_partitions(mtd, fixed_partitions, NULL, &parts);
+	if (ret <= 0)
+		return ret ?: -EINVAL;
+	ret = sunxi_nand_check_partitions(mtd, &parts);
+	if (ret)
+		goto out;
+	native = kcalloc(parts.nr_parts, sizeof(*native), GFP_KERNEL);
+	if (!native) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < parts.nr_parts; i++) {
+		const struct mtd_partition *part = &parts.parts[i];
+
+		if (!of_device_is_available(part->of_node))
+			continue;
+		if (!sunxi_nand_boot_partition(part)) {
+			native[nr_native++] = *part;
+			continue;
+		}
+		ret = sunxi_nand_boot_register(chip, part);
+		if (ret)
+			goto free_native;
+	}
+
+	/* Registering zero partitions would expose the whole native device. */
+	ret = 0;
+	if (nr_native) {
+		ret = mtd_device_parse_register(mtd, no_parsers, NULL, native, nr_native);
+		if (!ret)
+			chip->registered = true;
+	}
+free_native:
+	kfree(native);
+out:
+	mtd_part_parser_cleanup(&parts);
+	return ret;
+}
+
 static void sunxi_nand_chips_cleanup(struct sunxi_nfc *nfc)
 {
 	struct sunxi_nand_chip *sunxi_nand;
@@ -2799,6 +3253,8 @@ static void sunxi_nand_chips_cleanup(struct sunxi_nfc *nfc)
 			WARN_ON(ret);
 		}
 		nand_disconnect(chip);
+		/* Disconnect wakes view requests waiting for NAND resume. */
+		sunxi_nand_boot_cleanup(sunxi_nand);
 		list_del(&sunxi_nand->node);
 		mtd_put_master(nand_to_mtd(chip));
 	}
@@ -2829,6 +3285,7 @@ static int sunxi_nand_chip_init(struct device *dev, struct sunxi_nfc *nfc,
 		return -ENOMEM;
 
 	sunxi_nand->nsels = nsels;
+	INIT_LIST_HEAD(&sunxi_nand->boot_views);
 
 	for (i = 0; i < nsels; i++) {
 		ret = of_property_read_u32_index(np, "reg", i, &tmp);
@@ -2913,14 +3370,12 @@ static int sunxi_nand_chips_init(struct device *dev, struct sunxi_nfc *nfc)
 
 	/* NAND identification must finish before MTD users can access the NFC. */
 	list_for_each_entry(sunxi_nand, &nfc->chips, node) {
-		ret = mtd_device_register(nand_to_mtd(&sunxi_nand->nand), NULL, 0);
+		ret = sunxi_nand_register(sunxi_nand);
 		if (ret) {
 			dev_err(dev, "failed to register mtd device: %d\n", ret);
 			sunxi_nand_chips_cleanup(nfc);
 			return ret;
 		}
-
-		sunxi_nand->registered = true;
 	}
 
 	return 0;
