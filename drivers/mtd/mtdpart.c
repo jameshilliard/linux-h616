@@ -278,28 +278,34 @@ int mtd_add_partition(struct mtd_info *parent, const char *name,
 	part.size = length;
 	part.offset = offset;
 
-	child = allocate_partition(parent, &part, -1, offset);
-	if (IS_ERR(child))
-		return PTR_ERR(child);
-
 	mutex_lock(&master->master.partitions_lock);
+	if (master->master.unregistering) {
+		ret = -ENODEV;
+		goto err_unlock;
+	}
+
+	child = allocate_partition(parent, &part, -1, offset);
+	if (IS_ERR(child)) {
+		ret = PTR_ERR(child);
+		goto err_unlock;
+	}
+
 	list_add_tail(&child->part.node, &parent->partitions);
-	mutex_unlock(&master->master.partitions_lock);
 
 	ret = add_mtd_device(child);
 	if (ret)
 		goto err_remove_part;
 
 	mtd_add_partition_attrs(child);
+	mutex_unlock(&master->master.partitions_lock);
 
 	return 0;
 
 err_remove_part:
-	mutex_lock(&master->master.partitions_lock);
 	list_del(&child->part.node);
-	mutex_unlock(&master->master.partitions_lock);
-
 	free_partition(child);
+err_unlock:
+	mutex_unlock(&master->master.partitions_lock);
 
 	return ret;
 }

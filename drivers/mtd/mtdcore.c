@@ -915,6 +915,7 @@ static void mtd_set_dev_defaults(struct mtd_info *mtd)
 	INIT_LIST_HEAD(&mtd->partitions);
 	mutex_init(&mtd->master.partitions_lock);
 	mutex_init(&mtd->master.chrdev_lock);
+	mtd->master.unregistering = false;
 }
 
 static ssize_t mtd_otp_size(struct mtd_info *mtd, bool is_user)
@@ -1202,6 +1203,10 @@ EXPORT_SYMBOL_GPL(mtd_device_parse_register);
 int mtd_device_unregister(struct mtd_info *master)
 {
 	int err;
+
+	mutex_lock(&master->master.partitions_lock);
+	master->master.unregistering = true;
+	mutex_unlock(&master->master.partitions_lock);
 
 	if (master->_reboot) {
 		unregister_reboot_notifier(&master->reboot_notifier);
