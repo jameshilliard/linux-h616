@@ -539,7 +539,7 @@ void deregister_mtd_parser(struct mtd_part_parser *p)
 EXPORT_SYMBOL_GPL(deregister_mtd_parser);
 
 /*
- * Do not forget to update 'parse_mtd_partitions()' kerneldoc comment if you
+ * Do not forget to update 'mtd_parse_partitions()' kerneldoc comment if you
  * are changing this array!
  */
 static const char * const default_mtd_part_types[] = {
@@ -685,27 +685,32 @@ static int mtd_part_of_parse(struct mtd_info *master,
 }
 
 /**
- * parse_mtd_partitions - parse and register MTD partitions
+ * mtd_parse_partitions - parse MTD partitions without registering them
  *
  * @master: the master partition (describes whole MTD device)
  * @types: names of partition parsers to try or %NULL
  * @data: MTD partition parser-specific data
+ * @pparts: zero-initialized result, owned by the successful parser
  *
- * This function tries to find & register partitions on MTD device @master. It
+ * This function tries to find partitions on MTD device @master. It
  * uses MTD partition parsers, specified in @types. However, if @types is %NULL,
  * then the default list of parsers is used. The default list contains only the
  * "cmdlinepart" and "ofpart" parsers ATM.
  * Note: If there are more then one parser in @types, the kernel only takes the
  * partitions parsed out by the first parser.
  *
+ * On success, the caller must keep the returned table unchanged and call
+ * mtd_part_parser_cleanup() after using it. The parser module remains pinned
+ * until then. The caller must serialize parsing with device removal.
+ *
  * This function may return:
  * o a negative error code in case of failure
  * o number of found partitions otherwise
  */
-int parse_mtd_partitions(struct mtd_info *master, const char *const *types,
-			 struct mtd_part_parser_data *data)
+int mtd_parse_partitions(struct mtd_info *master, const char *const *types,
+			 struct mtd_part_parser_data *data,
+			 struct mtd_partitions *pparts)
 {
-	struct mtd_partitions pparts = { };
 	struct mtd_part_parser *parser;
 	int ret, err = 0;
 
@@ -720,7 +725,7 @@ int parse_mtd_partitions(struct mtd_info *master, const char *const *types,
 		 * handled in a separated function.
 		 */
 		if (!strcmp(*types, "ofpart")) {
-			ret = mtd_part_of_parse(master, &pparts);
+			ret = mtd_part_of_parse(master, pparts);
 		} else {
 			pr_debug("%s: parsing partitions %s\n", master->name,
 				 *types);
@@ -730,17 +735,13 @@ int parse_mtd_partitions(struct mtd_info *master, const char *const *types,
 			if (!parser)
 				continue;
 			pr_debug("%s: got parser %s\n", master->name, parser->name);
-			ret = mtd_part_do_parse(parser, master, &pparts, data);
+			ret = mtd_part_do_parse(parser, master, pparts, data);
 			if (ret <= 0)
 				mtd_part_parser_put(parser);
 		}
 		/* Found partitions! */
-		if (ret > 0) {
-			err = add_mtd_partitions(master, pparts.parts,
-						 pparts.nr_parts);
-			mtd_part_parser_cleanup(&pparts);
-			return err ? err : pparts.nr_parts;
-		}
+		if (ret > 0)
+			return ret;
 		/*
 		 * Stash the first error we see; only report it if no parser
 		 * succeeds
@@ -750,7 +751,27 @@ int parse_mtd_partitions(struct mtd_info *master, const char *const *types,
 	}
 	return err;
 }
+EXPORT_SYMBOL_GPL(mtd_parse_partitions);
 
+int parse_mtd_partitions(struct mtd_info *master, const char *const *types,
+			 struct mtd_part_parser_data *data)
+{
+	struct mtd_partitions parts = { };
+	int ret, err;
+
+	ret = mtd_parse_partitions(master, types, data, &parts);
+	if (ret <= 0)
+		return ret;
+
+	err = add_mtd_partitions(master, parts.parts, parts.nr_parts);
+	mtd_part_parser_cleanup(&parts);
+	return err ? err : ret;
+}
+
+/**
+ * mtd_part_parser_cleanup - release a parsed partition table and its parser
+ * @parts: result returned by mtd_parse_partitions()
+ */
 void mtd_part_parser_cleanup(struct mtd_partitions *parts)
 {
 	const struct mtd_part_parser *parser;
@@ -766,6 +787,7 @@ void mtd_part_parser_cleanup(struct mtd_partitions *parts)
 		mtd_part_parser_put(parser);
 	}
 }
+EXPORT_SYMBOL_GPL(mtd_part_parser_cleanup);
 
 /* Returns the size of the entire flash chip */
 uint64_t mtd_get_device_size(const struct mtd_info *mtd)

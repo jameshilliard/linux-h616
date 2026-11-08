@@ -92,6 +92,11 @@ struct mtd_partitions {
 	const struct mtd_part_parser *parser;
 };
 
+int mtd_parse_partitions(struct mtd_info *master, const char *const *types,
+			 struct mtd_part_parser_data *data,
+			 struct mtd_partitions *parts);
+void mtd_part_parser_cleanup(struct mtd_partitions *parts);
+
 extern int __register_mtd_parser(struct mtd_part_parser *parser,
 				 struct module *owner);
 #define register_mtd_parser(parser) __register_mtd_parser(parser, THIS_MODULE)
