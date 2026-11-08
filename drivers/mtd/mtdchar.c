@@ -613,6 +613,20 @@ static int mtdchar_adjust_io_lengths(struct mtd_info *mtd, uint64_t start,
 	return 0;
 }
 
+static u64 mtdchar_next_offset(struct mtd_info *mtd, u64 start,
+			       struct mtd_oob_ops *ops)
+{
+	u64 next = start + ops->retlen;
+	u64 pages;
+
+	if (!ops->oobretlen)
+		return next;
+
+	pages = DIV_ROUND_UP_ULL(ops->oobretlen, mtd_oobavail(mtd, ops));
+	return max(next, start - mtd_mod_by_ws(start, mtd) +
+		   pages * mtd->writesize);
+}
+
 static noinline_for_stack int
 mtdchar_write_ioctl(struct mtd_info *mtd, struct mtd_write_req __user *argp)
 {
@@ -662,12 +676,12 @@ mtdchar_write_ioctl(struct mtd_info *mtd, struct mtd_write_req __user *argp)
 		}
 	}
 
-	while (req.len > 0 || (!usr_data && req.ooblen > 0)) {
+	while (req.len > 0 || req.ooblen > 0) {
 		struct mtd_oob_ops ops = {
 			.mode = req.mode,
 			.len = min_t(size_t, req.len, datbuf_len),
 			.ooblen = min_t(size_t, req.ooblen, oobbuf_len),
-			.datbuf = datbuf,
+			.datbuf = req.len ? datbuf : NULL,
 			.oobbuf = oobbuf,
 		};
 
@@ -683,6 +697,10 @@ mtdchar_write_ioctl(struct mtd_info *mtd, struct mtd_write_req __user *argp)
 		ret = mtdchar_adjust_io_lengths(mtd, req.start, &ops, req.ooblen);
 		if (ret)
 			break;
+
+		/* Raw NAND accepts only one page per OOB-only write. */
+		if (!ops.len)
+			ops.ooblen = min_t(size_t, ops.ooblen, mtd_oobavail(mtd, &ops));
 
 		/*
 		 * For writes which are not OOB-only, adjust the amount of OOB
@@ -703,11 +721,7 @@ mtdchar_write_ioctl(struct mtd_info *mtd, struct mtd_write_req __user *argp)
 		if (ret)
 			break;
 
-		if (usr_data)
-			req.start += ops.retlen;
-		else
-			req.start += (u64)(ops.oobretlen / mtd_oobavail(mtd, &ops)) *
-				     mtd->writesize;
+		req.start = mtdchar_next_offset(mtd, req.start, &ops);
 		req.len -= ops.retlen;
 		usr_data += ops.retlen;
 
@@ -782,13 +796,13 @@ mtdchar_read_ioctl(struct mtd_info *mtd, struct mtd_read_req __user *argp)
 		}
 	}
 
-	while (req.len > 0 || (!usr_data && req.ooblen > 0)) {
+	while (req.len > 0 || req.ooblen > 0) {
 		struct mtd_req_stats stats;
 		struct mtd_oob_ops ops = {
 			.mode = req.mode,
 			.len = min_t(size_t, req.len, datbuf_len),
 			.ooblen = min_t(size_t, req.ooblen, oobbuf_len),
-			.datbuf = datbuf,
+			.datbuf = req.len ? datbuf : NULL,
 			.oobbuf = oobbuf,
 			.stats = &stats,
 		};
@@ -806,8 +820,7 @@ mtdchar_read_ioctl(struct mtd_info *mtd, struct mtd_read_req __user *argp)
 		ret = mtdchar_adjust_io_lengths(mtd, req.start, &ops, req.ooblen);
 		if (ret)
 			break;
-		if (ops.len < req.len)
-			adjust_oob_length(mtd, req.start, &ops);
+		adjust_oob_length(mtd, req.start, &ops);
 
 		ret = mtd_read_oob(mtd, (loff_t)req.start, &ops);
 
@@ -826,11 +839,7 @@ mtdchar_read_ioctl(struct mtd_info *mtd, struct mtd_read_req __user *argp)
 			break;
 		}
 
-		if (usr_data)
-			req.start += ops.retlen;
-		else
-			req.start += (u64)(ops.oobretlen / mtd_oobavail(mtd, &ops)) *
-				     mtd->writesize;
+		req.start = mtdchar_next_offset(mtd, req.start, &ops);
 		req.len -= ops.retlen;
 		usr_data += ops.retlen;
 
