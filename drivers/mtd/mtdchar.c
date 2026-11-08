@@ -576,18 +576,17 @@ static int mtdchar_blkpg_ioctl(struct mtd_info *mtd,
 static void adjust_oob_length(struct mtd_info *mtd, uint64_t start,
 			      struct mtd_oob_ops *ops)
 {
-	uint32_t start_page, end_page;
+	u64 pages;
 	u32 oob_per_page;
 
 	if (ops->len == 0 || ops->ooblen == 0)
 		return;
 
-	start_page = mtd_div_by_ws(start, mtd);
-	end_page = mtd_div_by_ws(start + ops->len - 1, mtd);
+	pages = mtd_div_by_ws(mtd_mod_by_ws(start, mtd) + (u64)ops->len - 1,
+			      mtd) + 1;
 	oob_per_page = mtd_oobavail(mtd, ops);
 
-	ops->ooblen = min_t(size_t, ops->ooblen,
-			    (end_page - start_page + 1) * oob_per_page);
+	ops->ooblen = min_t(u64, ops->ooblen, pages * oob_per_page);
 }
 
 static noinline_for_stack int
