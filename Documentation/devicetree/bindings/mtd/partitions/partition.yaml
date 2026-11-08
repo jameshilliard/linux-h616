@@ -52,6 +52,21 @@ properties:
       immune to paired-pages corruptions
     type: boolean
 
+  allwinner,boot-format:
+    type: boolean
+    description: |
+      Use the NAND page layout, ECC and randomization required by the
+      Allwinner SoC's BootROM. Currently supported on H616 with single-target,
+      8-bit NAND and 2048-byte physical pages. Each page stores 1024 payload
+      bytes followed by protected metadata and BCH-80 parity.
+
+      The reg property retains the physical main-area offset and length.
+      The range must be non-empty, eraseblock-aligned, within the chip and
+      disjoint from every other partition. Its decoded payload capacity and
+      erase size are half the physical main-area capacity and erase size.
+      The remainder of each physical page, including its spare area, is
+      accessible as raw OOB.
+
   linux,rootfs:
     description: Marks partition that contains root filesystem to mount and boot
       user space from
@@ -146,6 +161,17 @@ properties:
 
   nvmem-layout:
     $ref: /schemas/nvmem/layouts/nvmem-layout.yaml
+
+allOf:
+  - if:
+      required:
+        - allwinner,boot-format
+    then:
+      properties:
+        lock: false
+        slc-mode: false
+      required:
+        - reg
 
 if:
   not:

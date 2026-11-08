@@ -79,6 +79,7 @@ patternProperties:
           minimum: 0
           maximum: 1
 
+
     unevaluatedProperties: false
 
 required:
@@ -106,6 +107,14 @@ allOf:
           maxItems: 2
         clock-names:
           maxItems: 2
+      patternProperties:
+        "^nand@[a-f0-9]$":
+          properties:
+            partitions:
+              patternProperties:
+                "@[0-9a-f]+$":
+                  properties:
+                    allwinner,boot-format: false
 
   - if:
       properties:
@@ -126,24 +135,51 @@ allOf:
 examples:
   - |
     #include <dt-bindings/interrupt-controller/arm-gic.h>
-    #include <dt-bindings/clock/sun6i-rtc.h>
-    #include <dt-bindings/clock/sun8i-a23-a33-ccu.h>
-    #include <dt-bindings/reset/sun8i-a23-a33-ccu.h>
+    #include <dt-bindings/clock/sun50i-h616-ccu.h>
+    #include <dt-bindings/reset/sun50i-h616-ccu.h>
 
-    nand-controller@1c03000 {
-        compatible = "allwinner,sun8i-a23-nand-controller";
-        reg = <0x01c03000 0x1000>;
-        interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
-        clocks = <&ccu CLK_BUS_NAND>, <&ccu CLK_NAND>;
-        clock-names = "ahb", "mod";
+    nand-controller@4011000 {
+        compatible = "allwinner,sun50i-h616-nand-controller";
+        reg = <0x04011000 0x1000>;
+        interrupts = <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&ccu CLK_BUS_NAND>, <&ccu CLK_NAND0>,
+                 <&ccu CLK_NAND1>, <&ccu CLK_MBUS_NAND>;
+        clock-names = "ahb", "mod", "ecc", "mbus";
         resets = <&ccu RST_BUS_NAND>;
         reset-names = "ahb";
-        dmas = <&dma 5>;
-        dma-names = "rxtx";
-        pinctrl-names = "default";
-        pinctrl-0 = <&nand_pins &nand_cs0_pin &nand_rb0_pin>;
         #address-cells = <1>;
         #size-cells = <0>;
+
+        nand@0 {
+            reg = <0>;
+            allwinner,rb = <0>;
+            nand-bus-width = <8>;
+            nand-ecc-step-size = <1024>;
+            nand-ecc-strength = <32>;
+
+            partitions {
+                compatible = "fixed-partitions";
+                #address-cells = <1>;
+                #size-cells = <1>;
+
+                partition@0 {
+                    allwinner,boot-format;
+                    reg = <0x0 0x40000>;
+                    label = "spl";
+                };
+
+                partition@80000 {
+                    allwinner,boot-format;
+                    reg = <0x80000 0x40000>;
+                    label = "spl-backup";
+                };
+
+                partition@100000 {
+                    reg = <0x100000 0x400000>;
+                    label = "uboot";
+                };
+            };
+        };
     };
 
 ...
