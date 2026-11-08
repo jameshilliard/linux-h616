@@ -89,6 +89,7 @@ struct qcom_op {
  * @use_ecc:			request the controller to use ECC for the
  *				upcoming read/write
  * @bch_enabled:		flag to tell whether BCH ECC mode is used
+ * @registered:		whether the MTD device has been registered
  */
 struct qcom_nand_host {
 	struct qcom_nand_boot_partition *boot_partitions;
@@ -118,6 +119,7 @@ struct qcom_nand_host {
 	bool codeword_fixup;
 	bool use_ecc;
 	bool bch_enabled;
+	bool registered;
 };
 
 static struct qcom_nand_host *to_qcom_nand_host(struct nand_chip *chip)
@@ -2008,9 +2010,9 @@ static int qcom_nand_host_parse_boot_partitions(struct qcom_nand_controller *nan
 	return 0;
 }
 
-static int qcom_nand_host_init_and_register(struct qcom_nand_controller *nandc,
-					    struct qcom_nand_host *host,
-					    struct device_node *dn)
+static int qcom_nand_host_init(struct qcom_nand_controller *nandc,
+			       struct qcom_nand_host *host,
+			       struct device_node *dn)
 {
 	struct nand_chip *chip = &host->chip;
 	struct mtd_info *mtd = nand_to_mtd(chip);
@@ -2059,10 +2061,6 @@ static int qcom_nand_host_init_and_register(struct qcom_nand_controller *nandc,
 			goto err;
 	}
 
-	ret = mtd_device_parse_register(mtd, probes, NULL, NULL, 0);
-	if (ret)
-		goto err;
-
 	return 0;
 
 err:
@@ -2082,13 +2080,21 @@ static int qcom_probe_nand_devices(struct qcom_nand_controller *nandc)
 		if (!host)
 			return -ENOMEM;
 
-		ret = qcom_nand_host_init_and_register(nandc, host, child);
+		ret = qcom_nand_host_init(nandc, host, child);
 		if (ret) {
 			devm_kfree(dev, host);
 			return ret;
 		}
 
 		list_add_tail(&host->node, &nandc->host_list);
+	}
+
+	list_for_each_entry(host, &nandc->host_list, node) {
+		ret = mtd_device_parse_register(nand_to_mtd(&host->chip),
+						probes, NULL, NULL, 0);
+		if (ret)
+			return ret;
+		host->registered = true;
 	}
 
 	return ret;
@@ -2100,8 +2106,10 @@ static void qcom_nandc_cleanup_chips(struct qcom_nand_controller *nandc)
 	int ret;
 
 	list_for_each_entry_safe(host, tmp, &nandc->host_list, node) {
-		ret = mtd_device_unregister(nand_to_mtd(&host->chip));
-		WARN_ON(ret);
+		if (host->registered) {
+			ret = mtd_device_unregister(nand_to_mtd(&host->chip));
+			WARN_ON(ret);
+		}
 		nand_cleanup(&host->chip);
 		list_del(&host->node);
 	}
