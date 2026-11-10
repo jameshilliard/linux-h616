@@ -1207,7 +1207,7 @@ int mtd_device_parse_register(struct mtd_info *mtd, const char * const *types,
 		goto out;
 
 	if (IS_REACHABLE(CONFIG_MTD_VIRT_CONCAT)) {
-		ret = mtd_virt_concat_create_join();
+		ret = mtd_virt_concat_create_join(mtd);
 		if (ret < 0)
 			goto out;
 	}
@@ -1228,6 +1228,7 @@ int mtd_device_parse_register(struct mtd_info *mtd, const char * const *types,
 
 out:
 	if (ret) {
+		del_mtd_partitions(mtd);
 		nvmem_unregister(mtd->otp_user_nvmem);
 		nvmem_unregister(mtd->otp_factory_nvmem);
 	}
