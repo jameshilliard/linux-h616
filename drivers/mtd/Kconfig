@@ -4,6 +4,7 @@ config MTD_DEVICE
 menuconfig MTD
 	tristate "Memory Technology Device (MTD) support"
 	select MTD_DEVICE
+	select SRCU
 	imply NVMEM
 	help
 	  Memory Technology Devices are flash, RAM and similar chips, often

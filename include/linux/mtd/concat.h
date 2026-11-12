@@ -8,6 +8,7 @@
 #ifndef MTD_CONCAT_H
 #define MTD_CONCAT_H
 
+#include <linux/srcu.h>
 
 /*
  * Our storage structure:
@@ -17,6 +18,8 @@
  */
 struct mtd_concat {
 	struct mtd_info mtd;
+	struct srcu_struct srcu;
+	bool disconnected;
 	int num_subdev;
 	struct mtd_info *subdev[];
 };
@@ -27,6 +30,7 @@ struct mtd_info *mtd_concat_create(
     const char *name);          /* name for the new device   */
 
 void mtd_concat_destroy(struct mtd_info *mtd);
+void mtd_concat_disconnect(struct mtd_info *mtd);
 
 /**
  * mtd_virt_concat_node_create - Create a component for concatenation
@@ -43,23 +47,23 @@ int mtd_virt_concat_node_create(void);
  * mtd_virt_concat_add - add mtd_info object to the list of subdevices for concatenation
  * @mtd: pointer to new MTD device info structure
  *
- * Returns true if the mtd_info object is added successfully else returns false.
+ * Returns 1 if added, 0 if not a component, or a negative error code.
  *
  * The mtd_info object is added to the list of subdevices for concatenation.
- * It returns true if a match is found, and false if all subdevices have
- * already been added or if the mtd_info object does not match any of the
- * intended MTD devices.
+ * A duplicate component is rejected; the caller retains ownership on error
+ * or when the partition does not match a concatenation.
  */
-bool mtd_virt_concat_add(struct mtd_info *mtd);
+int mtd_virt_concat_add(struct mtd_info *mtd);
 
 /**
  * mtd_virt_concat_create_join - Create and register the concatenated MTD device
+ * @master: master whose partition registration has completed
  *
  * Returns 0 on succes, or a negative error code.
  *
  * Creates and registers the concatenated MTD device
  */
-int mtd_virt_concat_create_join(void);
+int mtd_virt_concat_create_join(struct mtd_info *master);
 
 /**
  * mtd_virt_concat_destroy - Remove the concat that includes a specific mtd device
@@ -68,9 +72,9 @@ int mtd_virt_concat_create_join(void);
  *
  * Returns 0 on succes, or a negative error code.
  *
- * If the mtd_info object is part of a concatenated device, all other MTD devices
- * within that concat are registered individually. The concatenated device is then
- * removed, along with its concatenation component.
+ * Unregister concatenations containing this device or its partitions and
+ * release its staged components. Components of other masters remain staged
+ * for a later rebind. Acquired handles retain disconnected concat metadata.
  *
  */
 int mtd_virt_concat_destroy(struct mtd_info *mtd);

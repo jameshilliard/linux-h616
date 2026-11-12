@@ -46,6 +46,10 @@ concat_read(struct mtd_info *mtd, loff_t from, size_t len,
 	int ret = 0, err;
 	int i;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 		size_t size, retsize;
@@ -97,6 +101,11 @@ concat_panic_write(struct mtd_info *mtd, loff_t to, size_t len,
 	struct mtd_concat *concat = CONCAT(mtd);
 	int err = -EINVAL;
 	int i;
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 		size_t size, retsize;
@@ -139,6 +148,10 @@ concat_write(struct mtd_info *mtd, loff_t to, size_t len,
 	int err = -EINVAL;
 	int i;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 		size_t size, retsize;
@@ -179,6 +192,10 @@ concat_writev(struct mtd_info *mtd, const struct kvec *vecs,
 	size_t total_len = 0;
 	int i;
 	int err = -EINVAL;
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
 
 	/* Calculate total length of data */
 	for (i = 0; i < count; i++)
@@ -251,6 +268,10 @@ concat_read_oob(struct mtd_info *mtd, loff_t from, struct mtd_oob_ops *ops)
 	struct mtd_oob_ops devops = *ops;
 	int i, err, ret = 0;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	ops->retlen = ops->oobretlen = 0;
 
 	for (i = 0; i < concat->num_subdev; i++) {
@@ -308,6 +329,10 @@ concat_write_oob(struct mtd_info *mtd, loff_t to, struct mtd_oob_ops *ops)
 	struct mtd_oob_ops devops = *ops;
 	int i, err;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	if (!(mtd->flags & MTD_WRITEABLE))
 		return -EROFS;
 
@@ -355,6 +380,10 @@ static int concat_erase(struct mtd_info *mtd, struct erase_info *instr)
 	int i, err;
 	uint64_t length, offset = 0;
 	struct erase_info *erase;
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
 
 	/*
 	 * Check for proper erase block alignment of the to-be-erased area.
@@ -472,6 +501,10 @@ static int concat_xxlock(struct mtd_info *mtd, loff_t ofs, uint64_t len,
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i, err = -EINVAL;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 		uint64_t size;
@@ -519,6 +552,10 @@ static int concat_is_locked(struct mtd_info *mtd, loff_t ofs, uint64_t len)
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i, err = -EINVAL;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 
@@ -541,6 +578,10 @@ static void concat_sync(struct mtd_info *mtd)
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 		mtd_sync(subdev);
@@ -551,6 +592,10 @@ static int concat_suspend(struct mtd_info *mtd)
 {
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i, rc = 0;
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return 0;
 
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
@@ -565,6 +610,10 @@ static void concat_resume(struct mtd_info *mtd)
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 		mtd_resume(subdev);
@@ -575,6 +624,10 @@ static int concat_block_isbad(struct mtd_info *mtd, loff_t ofs)
 {
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i, res = 0;
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
 
 	if (!mtd_can_have_bb(concat->subdev[0]))
 		return res;
@@ -599,6 +652,10 @@ static int concat_block_markbad(struct mtd_info *mtd, loff_t ofs)
 	struct mtd_concat *concat = CONCAT(mtd);
 	int i, err = -EINVAL;
 
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+
 	for (i = 0; i < concat->num_subdev; i++) {
 		struct mtd_info *subdev = concat->subdev[i];
 
@@ -615,6 +672,33 @@ static int concat_block_markbad(struct mtd_info *mtd, loff_t ofs)
 
 	return err;
 }
+
+static int concat_ooblayout_ecc(struct mtd_info *mtd, int section,
+			      struct mtd_oob_region *region)
+{
+	struct mtd_concat *concat = CONCAT(mtd);
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+	return mtd_ooblayout_ecc(concat->subdev[0], section, region);
+}
+
+static int concat_ooblayout_free(struct mtd_info *mtd, int section,
+			       struct mtd_oob_region *region)
+{
+	struct mtd_concat *concat = CONCAT(mtd);
+
+	guard(srcu_fast)(&concat->srcu);
+	if (READ_ONCE(concat->disconnected))
+		return -ENODEV;
+	return mtd_ooblayout_free(concat->subdev[0], section, region);
+}
+
+static const struct mtd_ooblayout_ops concat_ooblayout_ops = {
+	.ecc = concat_ooblayout_ecc,
+	.free = concat_ooblayout_free,
+};
 
 /*
  * This function constructs a virtual MTD device by concatenating
@@ -738,7 +822,8 @@ struct mtd_info *mtd_concat_create(struct mtd_info *subdev[],	/* subdevices to c
 
 	}
 
-	mtd_set_ooblayout(&concat->mtd, subdev[0]->ooblayout);
+	if (subdev[0]->ooblayout)
+		mtd_set_ooblayout(&concat->mtd, &concat_ooblayout_ops);
 
 	concat->num_subdev = num_devs;
 	concat->mtd.name = name;
@@ -877,13 +962,29 @@ struct mtd_info *mtd_concat_create(struct mtd_info *subdev[],	/* subdevices to c
 		erase_region_p->numblocks = tmp64;
 	}
 
+	if (init_srcu_struct_fast(&concat->srcu)) {
+		kfree(concat->mtd.eraseregions);
+		kfree(concat);
+		return NULL;
+	}
 	return &concat->mtd;
 }
+
+void mtd_concat_disconnect(struct mtd_info *mtd)
+{
+	struct mtd_concat *concat = CONCAT(mtd);
+
+	WRITE_ONCE(concat->disconnected, true);
+	synchronize_srcu(&concat->srcu);
+}
+EXPORT_SYMBOL_GPL(mtd_concat_disconnect);
 
 /* Cleans the context obtained from mtd_concat_create() */
 void mtd_concat_destroy(struct mtd_info *mtd)
 {
 	struct mtd_concat *concat = CONCAT(mtd);
+
+	cleanup_srcu_struct(&concat->srcu);
 	if (concat->mtd.numeraseregions)
 		kfree(concat->mtd.eraseregions);
 	kfree(concat);

@@ -93,6 +93,7 @@ static struct mtd_info *allocate_partition(struct mtd_info *parent,
 	child->parent = parent;
 	child->part.offset = part->offset;
 	INIT_LIST_HEAD(&child->partitions);
+	INIT_LIST_HEAD(&child->part.node);
 
 	if (child->part.offset == MTDPART_OFS_APPEND)
 		child->part.offset = cur_offset;
@@ -323,6 +324,9 @@ static int __mtd_del_partition(struct mtd_info *mtd)
 	struct mtd_info *child, *next;
 	int err;
 
+	if (IS_REACHABLE(CONFIG_MTD_VIRT_CONCAT))
+		mtd_virt_concat_destroy(mtd);
+
 	list_for_each_entry_safe(child, next, &mtd->partitions, part.node) {
 		err = __mtd_del_partition(child);
 		if (err)
@@ -374,6 +378,8 @@ int del_mtd_partitions(struct mtd_info *mtd)
 	pr_info("Deleting MTD partitions on \"%s\":\n", mtd->name);
 
 	mutex_lock(&master->master.partitions_lock);
+	if (IS_REACHABLE(CONFIG_MTD_VIRT_CONCAT))
+		mtd_virt_concat_destroy(mtd);
 	ret = __del_mtd_partitions(mtd);
 	mutex_unlock(&master->master.partitions_lock);
 
@@ -426,8 +432,15 @@ int add_mtd_partitions(struct mtd_info *parent,
 		}
 
 		if (IS_REACHABLE(CONFIG_MTD_VIRT_CONCAT)) {
-			if (mtd_virt_concat_add(child))
+			ret = mtd_virt_concat_add(child);
+			if (ret < 0) {
+				free_partition(child);
+				goto err_del_partitions;
+			}
+			if (ret) {
+				cur_offset = child->part.offset + child->part.size;
 				continue;
+			}
 		}
 
 		mutex_lock(&master->master.partitions_lock);
