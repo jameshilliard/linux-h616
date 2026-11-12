@@ -419,11 +419,11 @@ static int __macronix_30lfxg18ac_rw_otp(struct mtd_info *mtd,
 
 out_otp:
 	if (ret)
-		dev_err(&mtd->dev, "failed to perform OTP IO: %i\n", ret);
+		dev_err(mtd->dev, "failed to perform OTP IO: %i\n", ret);
 
 	ret = macronix_30lfxg18ac_otp_disable(nand);
 	if (ret)
-		dev_err(&mtd->dev, "failed to leave OTP mode after %s\n",
+		dev_err(mtd->dev, "failed to leave OTP mode after %s\n",
 			write ? "write" : "read");
 
 	nand_deselect_target(nand);

@@ -1730,7 +1730,7 @@ static void __init doc_dbg_register(struct mtd_info *floor)
 	if (IS_ERR_OR_NULL(root)) {
 		if (IS_ENABLED(CONFIG_DEBUG_FS) &&
 		    !IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER))
-			dev_warn(floor->dev.parent,
+			dev_warn(floor->parent_dev,
 				 "CONFIG_MTD_PARTITIONED_MASTER must be enabled to expose debugfs stuff\n");
 		return;
 	}
@@ -1817,7 +1817,7 @@ doc_probe_device(struct docg3_cascade *cascade, int floor, struct device *dev)
 	if (!mtd)
 		goto nomem2;
 	mtd->priv = docg3;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	bbt_nbpages = DIV_ROUND_UP(docg3->max_block + 1,
 				   8 * DOC_LAYOUT_PAGE_SIZE);
 	docg3->bbt = kcalloc(DOC_LAYOUT_PAGE_SIZE, bbt_nbpages, GFP_KERNEL);

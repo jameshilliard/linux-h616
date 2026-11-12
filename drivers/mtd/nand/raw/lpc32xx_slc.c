@@ -440,7 +440,7 @@ static int lpc32xx_xmit_dma(struct mtd_info *mtd, dma_addr_t dma,
 	/* DMA controller does flow control: */
 	host->dma_slave_config.device_fc = false;
 	if (dmaengine_slave_config(host->dma_chan, &host->dma_slave_config)) {
-		dev_err(mtd->dev.parent, "Failed to setup DMA slave\n");
+		dev_err(mtd->parent_dev, "Failed to setup DMA slave\n");
 		return -ENXIO;
 	}
 
@@ -449,13 +449,13 @@ static int lpc32xx_xmit_dma(struct mtd_info *mtd, dma_addr_t dma,
 	res = dma_map_sg(host->dma_chan->device->dev, &host->sgl, 1,
 			 DMA_BIDIRECTIONAL);
 	if (res != 1) {
-		dev_err(mtd->dev.parent, "Failed to map sg list\n");
+		dev_err(mtd->parent_dev, "Failed to map sg list\n");
 		return -ENXIO;
 	}
 	desc = dmaengine_prep_slave_sg(host->dma_chan, &host->sgl, 1, dir,
 				       flags);
 	if (!desc) {
-		dev_err(mtd->dev.parent, "Failed to prepare slave sg\n");
+		dev_err(mtd->parent_dev, "Failed to prepare slave sg\n");
 		goto out1;
 	}
 
@@ -559,13 +559,13 @@ static int lpc32xx_xfer(struct mtd_info *mtd, uint8_t *buf, int eccsubpages,
 	 * safety reasons for now.
 	 */
 	if (readl(SLC_STAT(host->io_base)) & SLCSTAT_DMA_FIFO) {
-		dev_warn(mtd->dev.parent, "FIFO not empty!\n");
+		dev_warn(mtd->parent_dev, "FIFO not empty!\n");
 		timeout = jiffies + msecs_to_jiffies(LPC32XX_DMA_TIMEOUT);
 		while ((readl(SLC_STAT(host->io_base)) & SLCSTAT_DMA_FIFO) &&
 		       time_before(jiffies, timeout))
 			cpu_relax();
 		if (!time_before(jiffies, timeout)) {
-			dev_err(mtd->dev.parent, "FIFO held data too long\n");
+			dev_err(mtd->parent_dev, "FIFO held data too long\n");
 			status = -EIO;
 		}
 	}
@@ -582,7 +582,7 @@ static int lpc32xx_xfer(struct mtd_info *mtd, uint8_t *buf, int eccsubpages,
 	if (readl(SLC_STAT(host->io_base)) & SLCSTAT_DMA_FIFO ||
 	    readl(SLC_TC(host->io_base))) {
 		/* Something is left in the FIFO, something is wrong */
-		dev_err(mtd->dev.parent, "DMA FIFO failure\n");
+		dev_err(mtd->parent_dev, "DMA FIFO failure\n");
 		status = -EIO;
 	}
 
@@ -726,9 +726,9 @@ static int lpc32xx_nand_dma_setup(struct lpc32xx_nand_host *host)
 {
 	struct mtd_info *mtd = nand_to_mtd(&host->nand_chip);
 
-	host->dma_chan = dma_request_chan(mtd->dev.parent, "rx-tx");
+	host->dma_chan = dma_request_chan(mtd->parent_dev, "rx-tx");
 	if (IS_ERR(host->dma_chan)) {
-		dev_err(mtd->dev.parent, "Failed to request DMA channel\n");
+		dev_err(mtd->parent_dev, "Failed to request DMA channel\n");
 		return PTR_ERR(host->dma_chan);
 	}
 
@@ -863,7 +863,7 @@ static int lpc32xx_nand_probe(struct platform_device *pdev)
 	nand_set_controller_data(chip, host);
 	nand_set_flash_node(chip, pdev->dev.of_node);
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	/* Get NAND clock */
 	host->clk = devm_clk_get_enabled(&pdev->dev, NULL);

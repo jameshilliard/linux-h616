@@ -164,7 +164,7 @@ static int socrates_nand_probe(struct platform_device *ofdev)
 	nand_set_controller_data(nand_chip, host);
 	nand_set_flash_node(nand_chip, ofdev->dev.of_node);
 	mtd->name = "socrates_nand";
-	mtd->dev.parent = &ofdev->dev;
+	mtd->parent_dev = &ofdev->dev;
 
 	nand_chip->legacy.cmd_ctrl = socrates_nand_cmd_ctrl;
 	nand_chip->legacy.read_byte = socrates_nand_read_byte;

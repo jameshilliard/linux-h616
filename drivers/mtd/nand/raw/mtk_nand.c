@@ -1296,7 +1296,7 @@ static int mtk_nfc_ecc_init(struct device *dev, struct mtd_info *mtd)
 static int mtk_nfc_attach_chip(struct nand_chip *chip)
 {
 	struct mtd_info *mtd = nand_to_mtd(chip);
-	struct device *dev = mtd->dev.parent;
+	struct device *dev = mtd->parent_dev;
 	struct mtk_nfc *nfc = nand_get_controller_data(chip);
 	struct mtk_nfc_nand_chip *mtk_nand = to_mtk_nand(chip);
 	int len;
@@ -1407,7 +1407,7 @@ static int mtk_nfc_nand_chip_init(struct device *dev, struct mtk_nfc *nfc,
 
 	mtd = nand_to_mtd(nand);
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	mtd->name = MTK_NAME;
 	mtd_set_ooblayout(mtd, &mtk_nfc_ooblayout_ops);
 

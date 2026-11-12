@@ -37,7 +37,7 @@ static int mtdpstore_block_isbad(struct mtdpstore_context *cxt, loff_t off)
 		return true;
 	ret = mtd_block_isbad(mtd, off);
 	if (ret < 0) {
-		dev_err(&mtd->dev, "mtd_block_isbad failed, aborting\n");
+		dev_err(mtd->dev, "mtd_block_isbad failed, aborting\n");
 		return ret;
 	} else if (ret > 0) {
 		set_bit(blknum, cxt->badmap);
@@ -63,7 +63,7 @@ static inline void mtdpstore_mark_used(struct mtdpstore_context *cxt,
 	struct mtd_info *mtd = cxt->mtd;
 	u64 zonenum = div_u64(off, cxt->info.kmsg_size);
 
-	dev_dbg(&mtd->dev, "mark zone %llu used\n", zonenum);
+	dev_dbg(mtd->dev, "mark zone %llu used\n", zonenum);
 	set_bit(zonenum, cxt->usedmap);
 }
 
@@ -73,7 +73,7 @@ static inline void mtdpstore_mark_unused(struct mtdpstore_context *cxt,
 	struct mtd_info *mtd = cxt->mtd;
 	u64 zonenum = div_u64(off, cxt->info.kmsg_size);
 
-	dev_dbg(&mtd->dev, "mark zone %llu unused\n", zonenum);
+	dev_dbg(mtd->dev, "mark zone %llu unused\n", zonenum);
 	clear_bit(zonenum, cxt->usedmap);
 }
 
@@ -87,7 +87,7 @@ static inline void mtdpstore_block_mark_unused(struct mtdpstore_context *cxt,
 	off = ALIGN_DOWN(off, mtd->erasesize);
 	zonenum = div_u64(off, cxt->info.kmsg_size);
 	while (zonecnt > 0) {
-		dev_dbg(&mtd->dev, "mark zone %llu unused\n", zonenum);
+		dev_dbg(mtd->dev, "mark zone %llu unused\n", zonenum);
 		clear_bit(zonenum, cxt->usedmap);
 		zonenum++;
 		zonecnt--;
@@ -142,7 +142,7 @@ static void mtdpstore_mark_removed(struct mtdpstore_context *cxt, loff_t off)
 	struct mtd_info *mtd = cxt->mtd;
 	u64 zonenum = div_u64(off, cxt->info.kmsg_size);
 
-	dev_dbg(&mtd->dev, "mark zone %llu removed\n", zonenum);
+	dev_dbg(mtd->dev, "mark zone %llu removed\n", zonenum);
 	set_bit(zonenum, cxt->rmmap);
 }
 
@@ -187,14 +187,14 @@ static int mtdpstore_erase_do(struct mtdpstore_context *cxt, loff_t off)
 	int ret;
 
 	off = ALIGN_DOWN(off, cxt->mtd->erasesize);
-	dev_dbg(&mtd->dev, "try to erase off 0x%llx\n", off);
+	dev_dbg(mtd->dev, "try to erase off 0x%llx\n", off);
 	erase.len = cxt->mtd->erasesize;
 	erase.addr = off;
 	ret = mtd_erase(cxt->mtd, &erase);
 	if (!ret)
 		mtdpstore_block_clear_removed(cxt, off);
 	else
-		dev_err(&mtd->dev, "erase of region [0x%llx, 0x%llx] on \"%s\" failed\n",
+		dev_err(mtd->dev, "erase of region [0x%llx, 0x%llx] on \"%s\" failed\n",
 		       (unsigned long long)erase.addr,
 		       (unsigned long long)erase.len, cxt->info.device);
 	return ret;
@@ -266,8 +266,8 @@ static int mtdpstore_security(struct mtdpstore_context *cxt, loff_t off)
 	}
 
 	if (ret)
-		dev_err(&mtd->dev, "all blocks bad!\n");
-	dev_dbg(&mtd->dev, "end security\n");
+		dev_err(mtd->dev, "all blocks bad!\n");
+	dev_dbg(mtd->dev, "end security\n");
 	return ret;
 }
 
@@ -285,10 +285,10 @@ static ssize_t mtdpstore_write(const char *buf, size_t size, loff_t off)
 	if (mtdpstore_is_used(cxt, off))
 		return -ENOMSG;
 
-	dev_dbg(&mtd->dev, "try to write off 0x%llx size %zu\n", off, size);
+	dev_dbg(mtd->dev, "try to write off 0x%llx size %zu\n", off, size);
 	ret = mtd_write(cxt->mtd, off, size, &retlen, (u_char *)buf);
 	if (ret < 0 || retlen != size) {
-		dev_err(&mtd->dev, "write failure at %lld (%zu of %zu written), err %d\n",
+		dev_err(mtd->dev, "write failure at %lld (%zu of %zu written), err %d\n",
 				off, retlen, size, ret);
 		return -EIO;
 	}
@@ -317,14 +317,14 @@ static ssize_t mtdpstore_read(char *buf, size_t size, loff_t off)
 	if (mtdpstore_block_isbad(cxt, off))
 		return -ENOMSG;
 
-	dev_dbg(&mtd->dev, "try to read off 0x%llx size %zu\n", off, size);
+	dev_dbg(mtd->dev, "try to read off 0x%llx size %zu\n", off, size);
 	for (done = 0, retlen = 0; done < size; done += retlen) {
 		retlen = 0;
 
 		ret = mtd_read(cxt->mtd, off + done, size - done, &retlen,
 				(u_char *)buf + done);
 		if (mtdpstore_is_io_error(ret)) {
-			dev_err(&mtd->dev, "read failure at %lld (%zu of %zu read), err %d\n",
+			dev_err(mtd->dev, "read failure at %lld (%zu of %zu read), err %d\n",
 					off + done, retlen, size - done, ret);
 			/* the zone may be broken, try next one */
 			return -ENOMSG;
@@ -337,7 +337,7 @@ static ssize_t mtdpstore_read(char *buf, size_t size, loff_t off)
 		 * valid or not.
 		 */
 		if (mtd_is_eccerr(ret)) {
-			dev_err(&mtd->dev, "ecc error at %lld (%zu of %zu read), err %d\n",
+			dev_err(mtd->dev, "ecc error at %lld (%zu of %zu read), err %d\n",
 					off + done, retlen, size - done, ret);
 			/* driver may not set retlen when ecc error */
 			retlen = retlen == 0 ? size - done : retlen;
@@ -369,7 +369,7 @@ static ssize_t mtdpstore_panic_write(const char *buf, size_t size, loff_t off)
 
 	ret = mtd_panic_write(cxt->mtd, off, size, &retlen, (u_char *)buf);
 	if (ret < 0 || size != retlen) {
-		dev_err(&mtd->dev, "panic write failure at %lld (%zu of %zu read), err %d\n",
+		dev_err(mtd->dev, "panic write failure at %lld (%zu of %zu read), err %d\n",
 				off, retlen, size, ret);
 		return -EIO;
 	}
@@ -391,10 +391,10 @@ static void mtdpstore_notify_add(struct mtd_info *mtd)
 	if (mtd->index != cxt->index || cxt->index < 0)
 		return;
 
-	dev_dbg(&mtd->dev, "found matching MTD device %s\n", mtd->name);
+	dev_dbg(mtd->dev, "found matching MTD device %s\n", mtd->name);
 
 	if (mtd->size < info->kmsg_size * 2) {
-		dev_err(&mtd->dev, "MTD partition %d not big enough\n",
+		dev_err(mtd->dev, "MTD partition %d not big enough\n",
 				mtd->index);
 		return;
 	}
@@ -405,23 +405,23 @@ static void mtdpstore_notify_add(struct mtd_info *mtd)
 	 * is designed on it.
 	 */
 	if (mtd->erasesize < info->kmsg_size) {
-		dev_err(&mtd->dev, "eraseblock size of MTD partition %d too small\n",
+		dev_err(mtd->dev, "eraseblock size of MTD partition %d too small\n",
 				mtd->index);
 		return;
 	}
 	if (unlikely(info->kmsg_size % mtd->writesize)) {
-		dev_err(&mtd->dev, "record size %lu KB must align to write size %d KB\n",
+		dev_err(mtd->dev, "record size %lu KB must align to write size %d KB\n",
 				info->kmsg_size / 1024,
 				mtd->writesize / 1024);
 		return;
 	}
 
 	longcnt = BITS_TO_LONGS(div_u64(mtd->size, info->kmsg_size));
-	cxt->rmmap = devm_kcalloc(&mtd->dev, longcnt, sizeof(long), GFP_KERNEL);
-	cxt->usedmap = devm_kcalloc(&mtd->dev, longcnt, sizeof(long), GFP_KERNEL);
+	cxt->rmmap = devm_kcalloc(mtd->dev, longcnt, sizeof(long), GFP_KERNEL);
+	cxt->usedmap = devm_kcalloc(mtd->dev, longcnt, sizeof(long), GFP_KERNEL);
 
 	longcnt = BITS_TO_LONGS(div_u64(mtd->size, mtd->erasesize));
-	cxt->badmap = devm_kcalloc(&mtd->dev, longcnt, sizeof(long), GFP_KERNEL);
+	cxt->badmap = devm_kcalloc(mtd->dev, longcnt, sizeof(long), GFP_KERNEL);
 
 	if (!cxt->rmmap || !cxt->usedmap || !cxt->badmap)
 		return;
@@ -436,12 +436,12 @@ static void mtdpstore_notify_add(struct mtd_info *mtd)
 
 	ret = register_pstore_device(&cxt->dev);
 	if (ret) {
-		dev_err(&mtd->dev, "mtd%d register to psblk failed\n",
+		dev_err(mtd->dev, "mtd%d register to psblk failed\n",
 				mtd->index);
 		return;
 	}
 	cxt->mtd = mtd;
-	dev_info(&mtd->dev, "Attached to MTD device %d\n", mtd->index);
+	dev_info(mtd->dev, "Attached to MTD device %d\n", mtd->index);
 }
 
 static int mtdpstore_flush_removed_do(struct mtdpstore_context *cxt,
@@ -477,7 +477,7 @@ static int mtdpstore_flush_removed_do(struct mtdpstore_context *cxt,
 		if (mtdpstore_is_used(cxt, off)) {
 			ret = mtd_write(mtd, off, zonesize, &retlen, buf);
 			if (ret)
-				dev_err(&mtd->dev, "write failure at %lld (%zu of %u written), err %d\n",
+				dev_err(mtd->dev, "write failure at %lld (%zu of %u written), err %d\n",
 						off, retlen, zonesize, ret);
 		}
 

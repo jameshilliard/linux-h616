@@ -182,7 +182,7 @@ static int xway_nand_probe(struct platform_device *pdev)
 
 	nand_set_flash_node(&data->chip, pdev->dev.of_node);
 	mtd = nand_to_mtd(&data->chip);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 
 	data->chip.legacy.cmd_ctrl = xway_cmd_ctrl;
 	data->chip.legacy.dev_ready = xway_dev_ready;

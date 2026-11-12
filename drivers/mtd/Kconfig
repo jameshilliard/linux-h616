@@ -1,5 +1,9 @@
+config MTD_DEVICE
+	bool
+
 menuconfig MTD
 	tristate "Memory Technology Device (MTD) support"
+	select MTD_DEVICE
 	imply NVMEM
 	help
 	  Memory Technology Devices are flash, RAM and similar chips, often

@@ -3579,7 +3579,7 @@ static int spi_nor_set_mtd_info(struct spi_nor *nor)
 	spi_nor_set_mtd_locking_ops(nor);
 	spi_nor_set_mtd_otp_ops(nor);
 
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	if (!mtd->name)
 		mtd->name = dev_name(dev);
 	mtd->type = MTD_NORFLASH;

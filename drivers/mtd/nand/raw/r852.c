@@ -589,7 +589,7 @@ static void r852_update_card_detect(struct r852_device *dev)
 static ssize_t media_type_show(struct device *sys_dev,
 			       struct device_attribute *attr, char *buf)
 {
-	struct mtd_info *mtd = container_of(sys_dev, struct mtd_info, dev);
+	struct mtd_info *mtd = dev_get_drvdata(sys_dev);
 	struct r852_device *dev = r852_get_dev(mtd);
 	char *data = dev->sm ? "smartmedia" : "xd";
 
@@ -635,7 +635,7 @@ static int r852_register_nand_device(struct r852_device *dev)
 
 	WARN_ON(dev->card_registered);
 
-	mtd->dev.parent = &dev->pci_dev->dev;
+	mtd->parent_dev = &dev->pci_dev->dev;
 
 	if (dev->readonly)
 		dev->chip->options |= NAND_ROM;
@@ -645,7 +645,7 @@ static int r852_register_nand_device(struct r852_device *dev)
 	if (sm_register_device(mtd, dev->sm))
 		goto error1;
 
-	if (device_create_file(&mtd->dev, &dev_attr_media_type)) {
+	if (device_create_file(mtd->dev, &dev_attr_media_type)) {
 		message("can't create media type sysfs attribute");
 		goto error3;
 	}
@@ -672,7 +672,7 @@ static void r852_unregister_nand_device(struct r852_device *dev)
 	if (!dev->card_registered)
 		return;
 
-	device_remove_file(&mtd->dev, &dev_attr_media_type);
+	device_remove_file(mtd->dev, &dev_attr_media_type);
 	WARN_ON(mtd_device_unregister(mtd));
 	nand_cleanup(dev->chip);
 	r852_engine_disable(dev);

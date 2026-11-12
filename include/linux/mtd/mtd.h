@@ -225,6 +225,8 @@ struct mtd_part {
  *		     sub-partitions.
  * @suspended: set to 1 when the device is suspended, 0 otherwise
  * @unregistering: removal has started; protected by partitions_lock
+ * @life_refcnt: optional lifetime reference count for the backing object
+ * @release: core callback freeing data after its last lifetime reference
  *
  * This struct is embedded in mtd_info and contains master-specific
  * properties/fields. The master is the root MTD device from the MTD partition
@@ -235,6 +237,8 @@ struct mtd_master {
 	struct mutex chrdev_lock;
 	unsigned int suspended : 1;
 	bool unregistering;
+	struct kref life_refcnt;
+	void (*release)(struct mtd_info *mtd);
 };
 
 struct mtd_info {
@@ -380,8 +384,15 @@ struct mtd_info {
 	void *priv;
 
 	struct module *owner;
-	struct device dev;
+	struct device *dev;
+	struct device *parent_dev;
+	struct device_node *of_node;
 	struct kref refcnt;
+	struct kref data_refcnt;
+	/* Protected by mtd_table_mutex; false after del_mtd_device(). */
+	bool registered;
+	/* Lifetime reference held until the MTD metadata is released. */
+	struct mtd_info *ref_master;
 	struct mtd_debug_info dbg;
 	struct nvmem_device *nvmem;
 	struct nvmem_device *otp_user_nvmem;
@@ -463,14 +474,14 @@ static inline void mtd_set_pairing_scheme(struct mtd_info *mtd,
 static inline void mtd_set_of_node(struct mtd_info *mtd,
 				   struct device_node *np)
 {
-	mtd->dev.of_node = np;
+	mtd->of_node = np;
 	if (!mtd->name)
 		of_property_read_string(np, "label", &mtd->name);
 }
 
 static inline struct device_node *mtd_get_of_node(struct mtd_info *mtd)
 {
-	return dev_of_node(&mtd->dev);
+	return mtd->of_node;
 }
 
 static inline u32 mtd_oobavail(struct mtd_info *mtd, struct mtd_oob_ops *ops)
@@ -683,6 +694,9 @@ extern int mtd_device_parse_register(struct mtd_info *mtd,
 #define mtd_device_register(master, parts, nr_parts)	\
 	mtd_device_parse_register(master, NULL, NULL, parts, nr_parts)
 extern int mtd_device_unregister(struct mtd_info *master);
+void mtd_set_release(struct mtd_info *master,
+		     void (*release)(struct mtd_info *mtd));
+void mtd_put_master(struct mtd_info *master);
 extern struct mtd_info *get_mtd_device(struct mtd_info *mtd, int num);
 struct mtd_info *get_mtd_device_by_dev(struct device *dev);
 extern int __get_mtd_device(struct mtd_info *mtd);

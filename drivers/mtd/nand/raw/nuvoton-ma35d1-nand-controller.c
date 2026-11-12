@@ -235,7 +235,7 @@ static int ma35_nand_hwecc_init(struct nand_chip *chip, struct ma35_nand_info *n
 {
 	struct ma35_nand_chip *nvtnand = to_ma35_nand(chip);
 	struct mtd_info *mtd = nand_to_mtd(chip);
-	struct device *dev = mtd->dev.parent;
+	struct device *dev = mtd->parent_dev;
 	u32 reg;
 
 	nand->buffer = devm_kzalloc(dev, mtd->writesize, GFP_KERNEL);
@@ -736,7 +736,7 @@ static int ma35_nand_attach_chip(struct nand_chip *chip)
 {
 	struct ma35_nand_info *nand = nand_get_controller_data(chip);
 	struct mtd_info *mtd = nand_to_mtd(chip);
-	struct device *dev = mtd->dev.parent;
+	struct device *dev = mtd->parent_dev;
 	u32 reg;
 
 	if (chip->options & NAND_BUSWIDTH_16) {
@@ -900,7 +900,7 @@ static int ma35_nand_chip_init(struct device *dev, struct ma35_nand_info *nand,
 
 	mtd = nand_to_mtd(chip);
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	mtd_set_ooblayout(mtd, &ma35_ooblayout_ops);
 	ret = nand_scan(chip, nsels);

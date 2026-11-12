@@ -165,7 +165,7 @@ static int f50l1g41lb_otp_lock(struct spinand_device *spinand, loff_t from,
 
 out:
 	if (spinand_upd_cfg(spinand, ESMT_F50L1G41LB_CFG_OTP_LOCK, 0)) {
-		dev_warn(&spinand_to_mtd(spinand)->dev,
+		dev_warn(spinand_to_mtd(spinand)->dev,
 			 "Can not disable OTP mode\n");
 		ret = -EIO;
 	}

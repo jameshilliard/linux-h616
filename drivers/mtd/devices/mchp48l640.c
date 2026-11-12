@@ -340,7 +340,7 @@ static int mchp48l640_probe(struct spi_device *spi)
 		flash->caps = &mchp48l640_caps;
 
 	mtd_set_of_node(&flash->mtd, spi->dev.of_node);
-	flash->mtd.dev.parent	= &spi->dev;
+	flash->mtd.parent_dev	= &spi->dev;
 	flash->mtd.type		= MTD_RAM;
 	flash->mtd.flags	= MTD_CAP_RAM;
 	flash->mtd.writesize	= flash->caps->page_size;

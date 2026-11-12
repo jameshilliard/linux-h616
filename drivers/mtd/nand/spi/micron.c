@@ -195,7 +195,7 @@ static int mt29f2g01abagd_otp_is_locked(struct spinand_device *spinand)
 
 	if (spinand_upd_cfg(spinand, MICRON_MT29F2G01ABAGD_CFG_OTP_LOCK,
 			    0)) {
-		dev_warn(&spinand_to_mtd(spinand)->dev,
+		dev_warn(spinand_to_mtd(spinand)->dev,
 			 "Can not disable OTP mode\n");
 		ret = -EIO;
 	}
@@ -279,7 +279,7 @@ static int mt29f2g01abagd_otp_lock(struct spinand_device *spinand, loff_t from,
 
 out:
 	if (spinand_upd_cfg(spinand, MICRON_MT29F2G01ABAGD_CFG_OTP_LOCK, 0)) {
-		dev_warn(&spinand_to_mtd(spinand)->dev,
+		dev_warn(spinand_to_mtd(spinand)->dev,
 			 "Can not disable OTP mode\n");
 		ret = -EIO;
 	}

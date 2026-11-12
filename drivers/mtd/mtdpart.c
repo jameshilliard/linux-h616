@@ -87,9 +87,9 @@ static struct mtd_info *allocate_partition(struct mtd_info *parent,
 	 * parent conditional on that option. Note, this is a way to
 	 * distinguish between the parent and its partitions in sysfs.
 	 */
-	child->dev.parent = IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER) || mtd_is_partition(parent) ?
-			    &parent->dev : parent->dev.parent;
-	child->dev.of_node = part->of_node;
+	child->parent_dev = IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER) || mtd_is_partition(parent) ?
+			    parent->dev : parent->parent_dev;
+	child->of_node = part->of_node;
 	child->parent = parent;
 	child->part.offset = part->offset;
 	INIT_LIST_HEAD(&child->partitions);
@@ -239,7 +239,7 @@ static const struct attribute *mtd_partition_attrs[] = {
 
 static int mtd_add_partition_attrs(struct mtd_info *new)
 {
-	int ret = sysfs_create_files(&new->dev.kobj, mtd_partition_attrs);
+	int ret = sysfs_create_files(&new->dev->kobj, mtd_partition_attrs);
 	if (ret)
 		printk(KERN_WARNING
 		       "mtd: failed to create partition attrs, err=%d\n", ret);
@@ -329,7 +329,7 @@ static int __mtd_del_partition(struct mtd_info *mtd)
 			return err;
 	}
 
-	sysfs_remove_files(&mtd->dev.kobj, mtd_partition_attrs);
+	sysfs_remove_files(&mtd->dev->kobj, mtd_partition_attrs);
 
 	list_del_init(&mtd->part.node);
 	err = del_mtd_device(mtd);
@@ -613,10 +613,10 @@ static int mtd_part_of_parse(struct mtd_info *master,
 	const char *fixed = "fixed-partitions";
 	int ret, err = 0;
 
-	dev = &master->dev;
+	dev = master->dev;
 	/* Use parent device (controller) if the top level MTD is not registered */
 	if (!IS_ENABLED(CONFIG_MTD_PARTITIONED_MASTER) && !mtd_is_partition(master))
-		dev = master->dev.parent;
+		dev = master->parent_dev;
 
 	np = mtd_get_of_node(master);
 	if (mtd_is_partition(master))

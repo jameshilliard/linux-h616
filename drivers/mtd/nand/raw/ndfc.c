@@ -155,7 +155,7 @@ static int ndfc_chip_init(struct ndfc_controller *ndfc,
 	chip->ecc.strength = 1;
 	nand_set_controller_data(chip, ndfc);
 
-	mtd->dev.parent = &ndfc->ofdev->dev;
+	mtd->parent_dev = &ndfc->ofdev->dev;
 
 	flash_np = of_get_next_child(node, NULL);
 	if (!flash_np)

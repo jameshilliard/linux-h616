@@ -146,7 +146,7 @@ ltq_mtd_probe(struct platform_device *pdev)
 		return -ENXIO;
 	}
 
-	ltq_mtd->mtd->dev.parent = &pdev->dev;
+	ltq_mtd->mtd->parent_dev = &pdev->dev;
 	mtd_set_of_node(ltq_mtd->mtd, pdev->dev.of_node);
 
 	cfi = ltq_mtd->map->fldrv_priv;

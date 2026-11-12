@@ -958,7 +958,7 @@ static int nand_davinci_probe(struct platform_device *pdev)
 	info->aemif		= dev_get_drvdata(pdev->dev.parent);
 
 	mtd			= nand_to_mtd(&info->chip);
-	mtd->dev.parent		= &pdev->dev;
+	mtd->parent_dev		= &pdev->dev;
 	nand_set_flash_node(&info->chip, pdev->dev.of_node);
 
 	/* options such as NAND_BBT_USE_FLASH */

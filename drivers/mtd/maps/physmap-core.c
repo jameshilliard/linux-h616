@@ -568,7 +568,7 @@ static int physmap_flash_probe(struct platform_device *dev)
 			err = -ENXIO;
 			goto err_out;
 		}
-		info->mtds[i]->dev.parent = &dev->dev;
+		info->mtds[i]->parent_dev = &dev->dev;
 	}
 
 	if (info->nmaps == 1) {

@@ -457,7 +457,7 @@ static int lpddr2_nvm_probe(struct platform_device *pdev)
 
 	/* Populate mtd_info data structure */
 	*mtd = lpddr2_nvm_mtd_info;
-	mtd->dev.parent		= &pdev->dev;
+	mtd->parent_dev		= &pdev->dev;
 	mtd->name		= pdev->dev.init_name;
 	mtd->priv		= map;
 	mtd->size		= resource_size(add_range);

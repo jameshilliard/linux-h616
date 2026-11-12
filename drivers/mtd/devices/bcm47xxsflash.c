@@ -252,7 +252,7 @@ static void bcm47xxsflash_fill_mtd(struct bcm47xxsflash *b47s,
 	struct mtd_info *mtd = &b47s->mtd;
 
 	mtd->priv = b47s;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	mtd->name = "bcm47xxsflash";
 
 	mtd->type = MTD_NORFLASH;

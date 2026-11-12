@@ -116,7 +116,7 @@ static int spinand_otp_rw(struct spinand_device *spinand, loff_t ofs,
 	*retlen = copied;
 
 	if (spinand_upd_cfg(spinand, CFG_OTP_ENABLE, 0)) {
-		dev_warn(&spinand_to_mtd(spinand)->dev,
+		dev_warn(spinand_to_mtd(spinand)->dev,
 			 "Can not disable OTP mode\n");
 		ret = -EIO;
 	}

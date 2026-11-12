@@ -1575,7 +1575,7 @@ static void atmel_nand_init(struct atmel_nand_controller *nc,
 	struct nand_chip *chip = &nand->base;
 	struct mtd_info *mtd = nand_to_mtd(chip);
 
-	mtd->dev.parent = nc->dev;
+	mtd->parent_dev = nc->dev;
 	nand->base.controller = &nc->base;
 
 	if (!nc->mck || !nc->caps->ops->setup_interface)

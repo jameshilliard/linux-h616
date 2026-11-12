@@ -102,7 +102,7 @@ int cobalt_flash_probe(struct cobalt *cobalt)
 	}
 
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = &cobalt->pci_dev->dev;
+	mtd->parent_dev = &cobalt->pci_dev->dev;
 	mtd_device_register(mtd, NULL, 0);
 	return 0;
 }

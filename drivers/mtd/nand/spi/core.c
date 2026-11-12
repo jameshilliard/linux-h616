@@ -2046,7 +2046,7 @@ static int spinand_probe(struct spi_mem *mem)
 	spinand_set_of_node(spinand, mem->spi->dev.of_node);
 	mutex_init(&spinand->lock);
 	mtd = spinand_to_mtd(spinand);
-	mtd->dev.parent = &mem->spi->dev;
+	mtd->parent_dev = &mem->spi->dev;
 
 	ret = spinand_init(spinand);
 	if (ret)

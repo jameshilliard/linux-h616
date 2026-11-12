@@ -677,7 +677,7 @@ static int ebu_nand_probe(struct platform_device *pdev)
 		goto err_cleanup_dma;
 	}
 
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	ebu_host->dev = dev;
 
 	platform_set_drvdata(pdev, ebu_host);

@@ -379,7 +379,7 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 	if (new->readonly)
 		set_disk_ro(gd, 1);
 
-	ret = device_add_disk(&new->mtd->dev, gd, NULL);
+	ret = device_add_disk(new->mtd->dev, gd, NULL);
 	if (ret)
 		goto out_cleanup_disk;
 

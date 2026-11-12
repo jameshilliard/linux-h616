@@ -5576,8 +5576,8 @@ static int nand_scan_ident(struct nand_chip *chip, unsigned int maxchips,
 	if (ret)
 		return ret;
 
-	if (!mtd->name && mtd->dev.parent)
-		mtd->name = dev_name(mtd->dev.parent);
+	if (!mtd->name && mtd->parent_dev)
+		mtd->name = dev_name(mtd->parent_dev);
 
 	/* Set the default functions */
 	nand_set_defaults(chip);

@@ -47,7 +47,7 @@ static int powernv_flash_async_op(struct mtd_info *mtd, enum flash_op op,
 		loff_t offset, size_t len, size_t *retlen, u_char *buf)
 {
 	struct powernv_flash *info = (struct powernv_flash *)mtd->priv;
-	struct device *dev = &mtd->dev;
+	struct device *dev = mtd->dev;
 	int token;
 	struct opal_msg msg;
 	int rc;
@@ -219,7 +219,7 @@ static int powernv_flash_set_driver_info(struct device *dev,
 	mtd->_erase = powernv_flash_erase;
 	mtd->_read = powernv_flash_read;
 	mtd->_write = powernv_flash_write;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 	mtd_set_of_node(mtd, dev->of_node);
 	return 0;
 }

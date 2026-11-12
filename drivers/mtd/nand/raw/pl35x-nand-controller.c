@@ -1082,7 +1082,7 @@ static int pl35x_nand_chip_init(struct pl35x_nandc *nfc,
 	chip->bbt_options = NAND_BBT_USE_FLASH;
 	chip->controller = &nfc->controller;
 	mtd = nand_to_mtd(chip);
-	mtd->dev.parent = nfc->dev;
+	mtd->parent_dev = nfc->dev;
 	nand_set_flash_node(chip, np);
 	if (!mtd->name) {
 		mtd->name = devm_kasprintf(nfc->dev, GFP_KERNEL,

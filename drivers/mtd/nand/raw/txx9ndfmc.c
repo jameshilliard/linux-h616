@@ -324,7 +324,7 @@ static int txx9ndfmc_probe(struct platform_device *dev)
 			continue;
 		chip = &txx9_priv->chip;
 		mtd = nand_to_mtd(chip);
-		mtd->dev.parent = &dev->dev;
+		mtd->parent_dev = &dev->dev;
 
 		chip->legacy.read_byte = txx9ndfmc_read_byte;
 		chip->legacy.read_buf = txx9ndfmc_read_buf;

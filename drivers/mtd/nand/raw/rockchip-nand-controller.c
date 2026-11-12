@@ -1028,7 +1028,7 @@ static int rk_nfc_ecc_init(struct device *dev, struct mtd_info *mtd)
 static int rk_nfc_attach_chip(struct nand_chip *chip)
 {
 	struct mtd_info *mtd = nand_to_mtd(chip);
-	struct device *dev = mtd->dev.parent;
+	struct device *dev = mtd->parent_dev;
 	struct rk_nfc *nfc = nand_get_controller_data(chip);
 	struct rk_nfc_nand_chip *rknand = rk_nfc_to_rknand(chip);
 	struct nand_ecc_ctrl *ecc = &chip->ecc;
@@ -1175,7 +1175,7 @@ static int rk_nfc_nand_chip_init(struct device *dev, struct rk_nfc *nfc,
 
 	mtd = nand_to_mtd(chip);
 	mtd->owner = THIS_MODULE;
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	if (!mtd->name) {
 		dev_err(nfc->dev, "NAND label property is mandatory\n");

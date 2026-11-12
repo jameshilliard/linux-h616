@@ -2514,7 +2514,7 @@ static int sunxi_nand_chip_init(struct device *dev, struct sunxi_nfc *nfc,
 	nand_set_flash_node(nand, np);
 
 	mtd = nand_to_mtd(nand);
-	mtd->dev.parent = dev;
+	mtd->parent_dev = dev;
 
 	ret = nand_scan(nand, nsels);
 	if (ret)

@@ -1398,7 +1398,7 @@ static int mxcnd_attach_chip(struct nand_chip *chip)
 {
 	struct mtd_info *mtd = nand_to_mtd(chip);
 	struct mxc_nand_host *host = nand_get_controller_data(chip);
-	struct device *dev = mtd->dev.parent;
+	struct device *dev = mtd->parent_dev;
 
 	chip->ecc.bytes = host->devtype_data->eccbytes;
 	host->eccsize = host->devtype_data->eccsize;
@@ -1708,7 +1708,7 @@ static int mxcnd_probe(struct platform_device *pdev)
 	/* structures must be linked */
 	this = &host->nand;
 	mtd = nand_to_mtd(this);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 	mtd->name = DRIVER_NAME;
 
 	/* 50 us command delay time */

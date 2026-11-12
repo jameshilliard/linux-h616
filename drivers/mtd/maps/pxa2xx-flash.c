@@ -89,7 +89,7 @@ static int pxa2xx_flash_probe(struct platform_device *pdev)
 		kfree(info);
 		return -EIO;
 	}
-	info->mtd->dev.parent = &pdev->dev;
+	info->mtd->parent_dev = &pdev->dev;
 
 	mtd_device_parse_register(info->mtd, probes, NULL, flash->parts,
 				  flash->nr_parts);

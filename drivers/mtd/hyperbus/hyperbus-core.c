@@ -112,7 +112,7 @@ int hyperbus_register_device(struct hyperbus_device *hbdev)
 		return -ENODEV;
 	}
 
-	hbdev->mtd->dev.parent = dev;
+	hbdev->mtd->parent_dev = dev;
 	mtd_set_of_node(hbdev->mtd, np);
 
 	ret = mtd_device_register(hbdev->mtd, NULL, 0);

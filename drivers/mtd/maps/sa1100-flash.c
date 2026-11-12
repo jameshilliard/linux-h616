@@ -242,7 +242,7 @@ static struct sa_info *sa1100_setup_mtd(struct platform_device *pdev,
 			goto err;
 		}
 	}
-	info->mtd->dev.parent = &pdev->dev;
+	info->mtd->parent_dev = &pdev->dev;
 
 	if (ret == 0)
 		return info;

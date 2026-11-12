@@ -685,7 +685,7 @@ static int cafe_nand_probe(struct pci_dev *pdev,
 	}
 
 	mtd = nand_to_mtd(&cafe->nand);
-	mtd->dev.parent = &pdev->dev;
+	mtd->parent_dev = &pdev->dev;
 	nand_set_controller_data(&cafe->nand, cafe);
 
 	cafe->pdev = pdev;
